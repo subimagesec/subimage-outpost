@@ -20,7 +20,7 @@ This container runs:
 
 | Variable              | Description                                                  | Default     |
 |-----------------------|--------------------------------------------------------------|-------------|
-| `NAME`                | Name for this outpost (for multiple outposts per tenant)    | `subimage`  |
+| `NAME`                | Name for this outpost (required if using multiple outposts within a tenant)    | `subimage`  |
 | `PROXY_HOST`          | Overrides the Host header sent to target                    | _None_      |
 | `VERIFY_TLS`          | Verify TLS certs (`true` or `false`)                        | `false`     |
 | `BEARER_TOKEN`        | Bearer token for authentication (added to Authorization header) | _None_  |
