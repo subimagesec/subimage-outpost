@@ -13,13 +13,13 @@ This container runs:
 |-----------------------|--------------------------------------------------------------|
 | `TAILSCALE_AUTHKEY`   | OAuth client secret from SubImage                            |
 | `TENANT_ID`           | Your tenant ID (provided by SubImage)                        |
-| `ENVIRONMENT`         | Environment (e.g. `prod`, `staging`). Defaults to `prod`     |
 | `PROXY_TARGET`        | Full target URL to proxy (e.g. `https://snipeit.internal`)   |
 
 ## Optional Environment Variables
 
 | Variable              | Description                                                  | Default     |
 |-----------------------|--------------------------------------------------------------|-------------|
+| `ENVIRONMENT`         | Environment (e.g. `prod`, `staging`)                        | `prod`      |
 | `NAME`                | Name for this outpost (required if using multiple outposts within a tenant)    | `subimage`  |
 | `PROXY_HOST`          | Overrides the Host header sent to target                    | _None_      |
 | `VERIFY_TLS`          | Verify TLS certs (`true` or `false`)                        | `false`     |
@@ -103,19 +103,9 @@ All outposts for a tenant+environment share the same OAuth secret and Tailscale 
 
 ---
 
-## Creating an OAuth Client for a Customer
-
-The OAuth client is created by terraform. You can retrieve it from the output of the `terraform output` command.
-
-Before enabling the OAuth client you need to create tags and ACL by applying `terraform/internal/infra/prod`
-
-Clients are created with specifics tags that ensure network isolation.
-
----
-
 ## Releasing a New Version
 
-This project uses [semantic versioning](https://semver.org) with **prefixed tags** "subimage-outpost":
+This project uses [semantic versioning](https://semver.org):
 
 ```bash
 make release VERSION=0.0.1
