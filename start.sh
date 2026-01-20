@@ -57,7 +57,7 @@ echo "Connected to Tailscale"
 
 # Start proxy
 echo "Starting proxy server on port ${PROXY_PORT}..."
-uvicorn proxy:app --host 0.0.0.0 --port ${PROXY_PORT} &
+cd /app && uvicorn proxy:app --host 0.0.0.0 --port ${PROXY_PORT} &
 
 sleep 2
 

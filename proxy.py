@@ -1,8 +1,11 @@
 # proxy.py
 import os
 from pathlib import Path
-from fastapi import FastAPI, Request, Response
+
 import httpx
+from fastapi import FastAPI
+from fastapi import Request
+from fastapi import Response
 
 app = FastAPI()
 
@@ -20,7 +23,7 @@ BEARER_TOKEN = None
 bearer_token_value = os.environ.get("BEARER_TOKEN")
 if bearer_token_value:
     BEARER_TOKEN = bearer_token_value.strip()
-    print(f"Loaded bearer token from BEARER_TOKEN environment variable")
+    print("Loaded bearer token from BEARER_TOKEN environment variable")
 
 # Option 2: Token from file path (if direct token not provided)
 if not BEARER_TOKEN:
@@ -34,6 +37,9 @@ if not BEARER_TOKEN:
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
+    if not TARGET:
+        raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
+
     url = f"{TARGET.rstrip('/')}/{path}"
     headers = dict(request.headers)
 
