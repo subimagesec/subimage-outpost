@@ -122,4 +122,4 @@ The container image supports both x86_64 (amd64) and ARM64 architectures. Docker
 1. Requires no inbound firewall changes.
 1. Encrypted via WireGuard automatically.
 1. Requires no changes to Cartography ingestion
-1. With direction connections, Tailscale is FAST
+1. With direct connections, Tailscale is FAST

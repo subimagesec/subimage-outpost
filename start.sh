@@ -2,13 +2,12 @@
 set -e
 
 # Clean shutdown handler - logout from Tailscale to remove ephemeral node immediately
-# Using signal numbers (15=SIGTERM, 2=SIGINT) for POSIX sh compatibility
+# Trap EXIT to ensure cleanup runs on signals, set -e failures, and normal exit
 cleanup() {
     echo "Shutting down outpost..."
     tailscale logout || true
-    exit 0
 }
-trap cleanup 15 2
+trap cleanup EXIT
 
 # Config
 PROXY_PORT="8080"

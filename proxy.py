@@ -8,6 +8,20 @@ from fastapi import Response
 
 app = FastAPI()
 
+# Hop-by-hop headers (RFC 2616 Section 13.5.1) must not be forwarded by proxies
+HOP_BY_HOP_HEADERS = frozenset(
+    [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    ]
+)
+
 TARGET = os.environ.get("PROXY_TARGET")  # e.g. "https://snipeit.internal.local"
 TARGET_HOST = os.environ.get("PROXY_HOST")  # optional: override Host header
 VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
@@ -40,10 +54,12 @@ async def proxy(request: Request, path: str):
         raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
 
     url = f"{TARGET.rstrip('/')}/{path}"
-    headers = dict(request.headers)
-
-    # Remove hop-by-hop headers
-    headers.pop("host", None)
+    # Filter hop-by-hop headers from request (case-insensitive)
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "host"
+    }
 
     if TARGET_HOST:
         headers["Host"] = TARGET_HOST
@@ -64,8 +80,15 @@ async def proxy(request: Request, path: str):
             params=request.query_params,
         )
 
+    # Filter hop-by-hop headers from response
+    response_headers = {
+        k: v
+        for k, v in proxied_response.headers.items()
+        if k.lower() not in HOP_BY_HOP_HEADERS
+    }
+
     return Response(
         content=proxied_response.content,
         status_code=proxied_response.status_code,
-        headers=proxied_response.headers,
+        headers=response_headers,
     )
