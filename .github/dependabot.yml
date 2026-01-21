@@ -1,0 +1,56 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 4
+      default-days: 7
+    commit-message:
+      prefix: "chore: "
+    open-pull-requests-limit: 1
+    labels:
+      - "dependencies"
+      - "python"
+      - "backend"
+    groups:
+      all-backend:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore: "
+    open-pull-requests-limit: 1
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      all-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore: "
+    open-pull-requests-limit: 1
+    labels:
+      - "dependencies"
+      - "docker"
+    groups:
+      docker-backend:
+        patterns:
+          - "*"
