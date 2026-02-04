@@ -1,5 +1,5 @@
 # Base image
-FROM python:3.11.14-slim@sha256:c24e9effa2821a6885165d930d939fec2af0dcf819276138f11dd45e200bd032 AS base
+FROM python:3.13-slim@sha256:2b9c9803c6a287cafa0a8c917211dddd23dcd2016f049690ee5219f5d3f1636e AS base
 # UID/GID for non-root user (https://github.com/hexops/dockerfile#do-not-use-a-uid-below-10000)
 ARG uid=10001
 ARG gid=10001
@@ -22,7 +22,7 @@ ENV HOME=/home/outpost
 # Builder stage - install dependencies with uv
 FROM base AS builder
 # Install uv
-COPY --from=ghcr.io/astral-sh/uv:0.7.3@sha256:87a04222b228501907f487b338ca6fc1514a93369bfce6930eb06c8d576e58a4 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.9.29@sha256:db9370c2b0b837c74f454bea914343da9f29232035aa7632a1b14dc03add9edb /uv /uvx /bin/
 # Copy dependency files
 COPY --chown=${uid}:${gid} pyproject.toml uv.lock ./
 # Create venv and install dependencies (without dev dependencies)
