@@ -1,13 +1,19 @@
 #!/bin/sh
 set -e
 
-# Clean shutdown handler - logout from Tailscale to remove ephemeral node immediately
-# Trap EXIT to ensure cleanup runs on signals, set -e failures, and normal exit
+# Logout so the ephemeral node is removed immediately instead of being
+# tombstoned ~1h. Trap INT/TERM so the RPC runs on signal-driven shutdowns
+# (set -e + wait below then triggers EXIT — _cleaned guards the second pass).
+# The sleep lets tailscaled flush the logout before it gets reaped.
+_cleaned=0
 cleanup() {
+    [ "$_cleaned" = "1" ] && return 0
+    _cleaned=1
     echo "Shutting down outpost..."
     tailscale logout || true
+    sleep 3
 }
-trap cleanup EXIT
+trap cleanup INT TERM EXIT
 
 # Config
 PROXY_PORT="8080"
