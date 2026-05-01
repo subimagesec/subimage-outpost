@@ -23,6 +23,7 @@ This container runs:
 | `NAME`                | Name for this outpost (required if using multiple outposts within a tenant)    | `subimage`  |
 | `PROXY_HOST`          | Overrides the Host header sent to target                    | _None_      |
 | `VERIFY_TLS`          | Verify TLS certs (`true` or `false`)                        | `false`     |
+| `CA_BUNDLE`           | Path to a CA bundle file used to verify TLS (only honored when `VERIFY_TLS=true`). If unset, defaults to the Kubernetes serviceaccount CA at `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` when that file exists. | _None_ |
 | `BEARER_TOKEN`        | Bearer token for authentication (added to Authorization header) | _None_  |
 | `BEARER_TOKEN_PATH`   | Path to file containing bearer token                        | _None_      |
 
