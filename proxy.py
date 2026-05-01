@@ -1,4 +1,5 @@
 import os
+import ssl
 from pathlib import Path
 
 import httpx
@@ -25,6 +26,27 @@ HOP_BY_HOP_HEADERS = frozenset(
 TARGET = os.environ.get("PROXY_TARGET")  # e.g. "https://snipeit.internal.local"
 TARGET_HOST = os.environ.get("PROXY_HOST")  # optional: override Host header
 VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
+
+# Default to the in-cluster Kubernetes serviceaccount CA bundle if present;
+# users can override with CA_BUNDLE for non-kube self-signed targets.
+DEFAULT_K8S_CA_BUNDLE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+ca_bundle_env = os.environ.get("CA_BUNDLE")
+if ca_bundle_env:
+    CA_BUNDLE_PATH: Path | None = Path(ca_bundle_env)
+elif Path(DEFAULT_K8S_CA_BUNDLE).is_file():
+    CA_BUNDLE_PATH = Path(DEFAULT_K8S_CA_BUNDLE)
+else:
+    CA_BUNDLE_PATH = None
+
+if VERIFY_TLS and CA_BUNDLE_PATH is not None:
+    if not CA_BUNDLE_PATH.is_file():
+        raise RuntimeError(f"CA_BUNDLE path does not exist: {CA_BUNDLE_PATH}")
+    VERIFY: bool | ssl.SSLContext = ssl.create_default_context(
+        cafile=str(CA_BUNDLE_PATH)
+    )
+    print(f"Loaded CA bundle for TLS verification: {CA_BUNDLE_PATH}")
+else:
+    VERIFY = VERIFY_TLS
 
 if not TARGET:
     raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
@@ -71,7 +93,7 @@ async def proxy(request: Request, path: str):
     if BEARER_TOKEN and "authorization" not in headers:
         headers["Authorization"] = f"Bearer {BEARER_TOKEN}"
 
-    async with httpx.AsyncClient(verify=VERIFY_TLS) as client:
+    async with httpx.AsyncClient(verify=VERIFY) as client:
         proxied_response = await client.request(
             method=request.method,
             url=url,
