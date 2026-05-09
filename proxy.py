@@ -1,5 +1,7 @@
+import logging
 import os
 import ssl
+from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
@@ -8,6 +10,7 @@ from fastapi import Request
 from fastapi import Response
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # Hop-by-hop headers (RFC 2616 Section 13.5.1) must not be forwarded by proxies
 HOP_BY_HOP_HEADERS = frozenset(
@@ -51,35 +54,73 @@ else:
 if not TARGET:
     raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
 
-# Load bearer token from environment variable or file path
-BEARER_TOKEN = None
+# Load static bearer tokens from the environment once. File-backed tokens are
+# read per request because Kubernetes projected ServiceAccount tokens rotate.
+STATIC_BEARER_TOKEN: str | None = None
+BEARER_TOKEN_PATH: Path | None = None
+_FILE_BEARER_TOKEN_CACHE: tuple[str, tuple[int, int, int]] | None = None
 
 # Option 1: Direct token from environment variable
 bearer_token_value = os.environ.get("BEARER_TOKEN")
 if bearer_token_value:
-    BEARER_TOKEN = bearer_token_value.strip()
+    STATIC_BEARER_TOKEN = bearer_token_value.strip()
     print("Loaded bearer token from BEARER_TOKEN environment variable")
 
 # Option 2: Token from file path (if direct token not provided)
-if not BEARER_TOKEN:
+if not STATIC_BEARER_TOKEN:
     bearer_token_path_str = os.environ.get("BEARER_TOKEN_PATH")
     if bearer_token_path_str:
-        bearer_token_path = Path(bearer_token_path_str)
-        if bearer_token_path.exists():
-            BEARER_TOKEN = bearer_token_path.read_text().strip()
-            print(f"Loaded bearer token from file: {bearer_token_path_str}")
+        BEARER_TOKEN_PATH = Path(bearer_token_path_str)
+        if BEARER_TOKEN_PATH.exists():
+            print(f"Configured bearer token file: {bearer_token_path_str}")
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy(request: Request, path: str):
-    if not TARGET:
-        raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
+def get_bearer_token() -> str | None:
+    global _FILE_BEARER_TOKEN_CACHE
 
-    url = f"{TARGET.rstrip('/')}/{path}"
-    # Filter hop-by-hop headers from request (case-insensitive)
+    if STATIC_BEARER_TOKEN:
+        return STATIC_BEARER_TOKEN
+
+    if BEARER_TOKEN_PATH is None:
+        return None
+
+    try:
+        file_stat = BEARER_TOKEN_PATH.stat()
+    except OSError:
+        if _FILE_BEARER_TOKEN_CACHE:
+            logger.warning("Unable to stat bearer token file; using cached token")
+            return _FILE_BEARER_TOKEN_CACHE[0]
+        else:
+            logger.warning("Unable to stat bearer token file")
+            return None
+
+    cache_key = (file_stat.st_mtime_ns, file_stat.st_size, file_stat.st_ino)
+
+    if _FILE_BEARER_TOKEN_CACHE and cache_key == _FILE_BEARER_TOKEN_CACHE[1]:
+        return _FILE_BEARER_TOKEN_CACHE[0]
+
+    try:
+        token = BEARER_TOKEN_PATH.read_text().strip()
+    except OSError:
+        if _FILE_BEARER_TOKEN_CACHE:
+            logger.warning("Unable to read bearer token file; using cached token")
+            return _FILE_BEARER_TOKEN_CACHE[0]
+        else:
+            logger.warning("Unable to read bearer token file")
+            return None
+
+    if not token:
+        logger.warning("Bearer token file is empty")
+        return None
+
+    _FILE_BEARER_TOKEN_CACHE = (token, cache_key)
+    return token
+
+
+def build_proxy_headers(request_headers: Mapping[str, str]) -> dict[str, str]:
     headers = {
         k: v
-        for k, v in request.headers.items()
+        for k, v in request_headers.items()
         if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "host"
     }
 
@@ -88,10 +129,21 @@ async def proxy(request: Request, path: str):
 
     headers.setdefault("User-Agent", "Mozilla/5.0 (Tailscale Proxy)")
 
-    # Add bearer token for authentication (e.g., Kubernetes API, internal services)
-    # Only add if not already present (allows passing custom Authorization)
-    if BEARER_TOKEN and "authorization" not in headers:
-        headers["Authorization"] = f"Bearer {BEARER_TOKEN}"
+    bearer_token = get_bearer_token()
+    has_authorization = any(k.lower() == "authorization" for k in headers)
+    if bearer_token and not has_authorization:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    return headers
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy(request: Request, path: str):
+    if not TARGET:
+        raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
+
+    url = f"{TARGET.rstrip('/')}/{path}"
+    headers = build_proxy_headers(request.headers)
 
     async with httpx.AsyncClient(verify=VERIFY) as client:
         proxied_response = await client.request(
