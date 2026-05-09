@@ -36,7 +36,7 @@ The `TENANT_ID`, `ENVIRONMENT`, and `NAME` automatically configure:
 The proxy supports automatic authentication via bearer tokens:
 
 - **`BEARER_TOKEN`**: Provide the token directly as an environment variable
-- **`BEARER_TOKEN_PATH`**: Provide a path to a file containing the token (e.g., Kubernetes ServiceAccount token)
+- **`BEARER_TOKEN_PATH`**: Provide a path to a file containing the token (e.g., Kubernetes ServiceAccount token). File-backed tokens are reloaded for each proxied request so projected Kubernetes ServiceAccount token rotation is honored.
 
 If either variable is set, the proxy automatically adds an `Authorization: Bearer <token>` header to all proxied requests (unless the request already contains an Authorization header).
 
