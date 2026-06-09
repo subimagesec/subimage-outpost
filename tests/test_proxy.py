@@ -241,6 +241,25 @@ def test_logtee_tees_and_rotates(tmp_path):
     assert "line 29" in log_file.read_text()
 
 
+def test_logtee_rejects_non_positive_config(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import logtee
+
+    # Non-positive / unparseable values must fall back to the safe defaults so
+    # rotation (and the bounded-log guarantee) can't be silently disabled.
+    monkeypatch.setenv("OUTPOST_LOG_MAX_BYTES", "0")
+    assert logtee._positive_int_env("OUTPOST_LOG_MAX_BYTES", 5000000) == 5000000
+
+    monkeypatch.setenv("OUTPOST_LOG_BACKUP_COUNT", "-1")
+    assert logtee._positive_int_env("OUTPOST_LOG_BACKUP_COUNT", 3) == 3
+
+    monkeypatch.setenv("OUTPOST_LOG_MAX_BYTES", "notanint")
+    assert logtee._positive_int_env("OUTPOST_LOG_MAX_BYTES", 5000000) == 5000000
+
+    monkeypatch.setenv("OUTPOST_LOG_MAX_BYTES", "1024")
+    assert logtee._positive_int_env("OUTPOST_LOG_MAX_BYTES", 5000000) == 1024
+
+
 def test_logs_missing_file_is_empty(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTPOST_LOG_FILE", str(tmp_path / "missing.log"))
 

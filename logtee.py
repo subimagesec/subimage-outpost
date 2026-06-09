@@ -15,14 +15,30 @@ DEFAULT_MAX_BYTES = 5000000
 DEFAULT_BACKUP_COUNT = 3
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a strictly positive int from the env, falling back to `default`.
+
+    A non-positive maxBytes/backupCount would silently disable rotation and break
+    the bounded-log guarantee, so reject those (and unparseable values).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def main() -> None:
     log_path = (
         sys.argv[1]
         if len(sys.argv) > 1
         else os.environ.get("OUTPOST_LOG_FILE", "/tmp/outpost.log")
     )
-    max_bytes = int(os.environ.get("OUTPOST_LOG_MAX_BYTES", DEFAULT_MAX_BYTES))
-    backup_count = int(os.environ.get("OUTPOST_LOG_BACKUP_COUNT", DEFAULT_BACKUP_COUNT))
+    max_bytes = _positive_int_env("OUTPOST_LOG_MAX_BYTES", DEFAULT_MAX_BYTES)
+    backup_count = _positive_int_env("OUTPOST_LOG_BACKUP_COUNT", DEFAULT_BACKUP_COUNT)
 
     handler = logging.handlers.RotatingFileHandler(
         log_path,
