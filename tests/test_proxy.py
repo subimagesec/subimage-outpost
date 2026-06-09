@@ -1,5 +1,9 @@
+import os
+import subprocess
 import sys
 from pathlib import Path
+
+from fastapi.testclient import TestClient
 
 
 def load_proxy(monkeypatch, token_path: Path | None = None, token: str | None = None):
@@ -135,3 +139,157 @@ def test_build_proxy_headers_preserves_lowercase_authorization(monkeypatch, tmp_
 
     assert headers["authorization"] == "Bearer caller-token"
     assert "Authorization" not in headers
+
+
+def test_version_endpoint(monkeypatch):
+    monkeypatch.setenv("OUTPOST_VERSION", "9.9.9")
+
+    proxy = load_proxy(monkeypatch)
+    client = TestClient(proxy.app)
+
+    response = client.get("/_internal/version")
+
+    assert response.status_code == 200
+    assert response.json() == {"version": "9.9.9"}
+
+
+def test_logs_pagination(monkeypatch, tmp_path):
+    log_file = tmp_path / "outpost.log"
+    log_file.write_text("".join(f"line {i}\n" for i in range(10)))
+    monkeypatch.setenv("OUTPOST_LOG_FILE", str(log_file))
+
+    proxy = load_proxy(monkeypatch)
+    client = TestClient(proxy.app)
+
+    # Default offset returns the tail (last `count` lines).
+    tail = client.get("/_internal/logs", params={"count": 3}).json()
+    assert tail == {
+        "total": 10,
+        "offset": 7,
+        "count": 3,
+        "lines": ["line 7", "line 8", "line 9"],
+    }
+
+    # Explicit offset returns the [offset, offset + count) window in file order.
+    page = client.get("/_internal/logs", params={"count": 2, "offset": 0}).json()
+    assert page == {
+        "total": 10,
+        "offset": 0,
+        "count": 2,
+        "lines": ["line 0", "line 1"],
+    }
+
+    # Offset past EOF yields an empty window but still reports the total.
+    past = client.get("/_internal/logs", params={"count": 5, "offset": 50}).json()
+    assert past == {"total": 10, "offset": 50, "count": 0, "lines": []}
+
+
+def test_logs_reads_rotated_files_in_order(monkeypatch, tmp_path):
+    # logtee.py keeps `<name>` (active) plus `<name>.1` (newest backup) ..
+    # `<name>.N` (oldest). The endpoint must stitch them oldest-first.
+    log_file = tmp_path / "outpost.log"
+    (tmp_path / "outpost.log.2").write_text("old 0\nold 1\n")
+    (tmp_path / "outpost.log.1").write_text("mid 0\nmid 1\n")
+    log_file.write_text("new 0\nnew 1\n")
+    monkeypatch.setenv("OUTPOST_LOG_FILE", str(log_file))
+
+    proxy = load_proxy(monkeypatch)
+    client = TestClient(proxy.app)
+
+    body = client.get("/_internal/logs", params={"count": 100, "offset": 0}).json()
+
+    assert body["total"] == 6
+    assert body["lines"] == [
+        "old 0",
+        "old 1",
+        "mid 0",
+        "mid 1",
+        "new 0",
+        "new 1",
+    ]
+
+
+def test_logtee_tees_and_rotates(tmp_path):
+    log_file = tmp_path / "outpost.log"
+    script = Path(__file__).resolve().parents[1] / "logtee.py"
+    env = {
+        **os.environ,
+        # Tiny cap to force several rotations and prove disk stays bounded.
+        "OUTPOST_LOG_MAX_BYTES": "40",
+        "OUTPOST_LOG_BACKUP_COUNT": "2",
+    }
+    payload = "".join(f"line {i}\n" for i in range(30))
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(log_file)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    # Console (stdout) still sees every line.
+    assert "line 0" in result.stdout
+    assert "line 29" in result.stdout
+
+    # Rotation happened and the number of files is bounded to backupCount + 1.
+    log_files = sorted(p.name for p in tmp_path.glob("outpost.log*"))
+    assert log_files == ["outpost.log", "outpost.log.1", "outpost.log.2"]
+
+    # The active file holds the most recent line.
+    assert "line 29" in log_file.read_text()
+
+
+def test_logtee_rejects_non_positive_config(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import logtee
+
+    # Non-positive / unparseable values must fall back to the safe defaults so
+    # rotation (and the bounded-log guarantee) can't be silently disabled.
+    monkeypatch.setenv("OUTPOST_LOG_MAX_BYTES", "0")
+    assert logtee._positive_int_env("OUTPOST_LOG_MAX_BYTES", 5000000) == 5000000
+
+    monkeypatch.setenv("OUTPOST_LOG_BACKUP_COUNT", "-1")
+    assert logtee._positive_int_env("OUTPOST_LOG_BACKUP_COUNT", 3) == 3
+
+    monkeypatch.setenv("OUTPOST_LOG_MAX_BYTES", "notanint")
+    assert logtee._positive_int_env("OUTPOST_LOG_MAX_BYTES", 5000000) == 5000000
+
+    monkeypatch.setenv("OUTPOST_LOG_MAX_BYTES", "1024")
+    assert logtee._positive_int_env("OUTPOST_LOG_MAX_BYTES", 5000000) == 1024
+
+
+def test_logs_missing_file_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTPOST_LOG_FILE", str(tmp_path / "missing.log"))
+
+    proxy = load_proxy(monkeypatch)
+    client = TestClient(proxy.app)
+
+    body = client.get("/_internal/logs").json()
+
+    assert body == {"total": 0, "offset": 0, "count": 0, "lines": []}
+
+
+def test_logs_rejects_invalid_params(monkeypatch, tmp_path):
+    log_file = tmp_path / "outpost.log"
+    log_file.write_text("line\n")
+    monkeypatch.setenv("OUTPOST_LOG_FILE", str(log_file))
+
+    proxy = load_proxy(monkeypatch)
+    client = TestClient(proxy.app)
+
+    assert client.get("/_internal/logs", params={"count": 0}).status_code == 400
+    assert client.get("/_internal/logs", params={"offset": -1}).status_code == 400
+
+
+def test_internal_routes_not_proxied(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+    client = TestClient(proxy.app)
+
+    # /_internal/version must be served locally; if it fell through to the
+    # catch-all proxy it would try to reach PROXY_TARGET and not return our body.
+    response = client.get("/_internal/version")
+
+    assert response.status_code == 200
+    assert "version" in response.json()

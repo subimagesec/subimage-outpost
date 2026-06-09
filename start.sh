@@ -15,6 +15,17 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
+# Tee all stdout/stderr to a size-rotated log file so the /_internal/logs
+# endpoint can read it back (bounded on disk), while still printing to the
+# console for `kubectl/docker logs`. /bin/sh is dash (no process substitution),
+# so use the FIFO + background reader idiom; logtee.py does the rotation + tee.
+export OUTPOST_LOG_FILE="${OUTPOST_LOG_FILE:-/tmp/outpost.log}"
+_log_pipe="$(mktemp -u)"
+mkfifo "$_log_pipe"
+python3 /app/logtee.py "$OUTPOST_LOG_FILE" < "$_log_pipe" &
+exec > "$_log_pipe" 2>&1
+rm -f "$_log_pipe"
+
 # Config
 PROXY_PORT="8080"
 TAILSCALE_SERVE_PORT="80"
@@ -62,7 +73,7 @@ echo "Connected to Tailscale"
 
 # Start proxy
 echo "Starting proxy server on port ${PROXY_PORT}..."
-cd /app && uvicorn proxy:app --host 0.0.0.0 --port ${PROXY_PORT} &
+cd /app && uvicorn proxy:app --host 127.0.0.1 --port ${PROXY_PORT} &
 
 sleep 2
 
