@@ -38,6 +38,7 @@ jobs:
       - run: uv run --frozen pytest -q
 
   version-bumped:
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
