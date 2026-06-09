@@ -31,10 +31,14 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 # Production image
 FROM base AS production
+# Version injected at build time from the git tag, e.g.
+# docker build --build-arg VERSION="$(git describe --tags --always)"
+ARG VERSION=0.0.0
+ENV OUTPOST_VERSION=${VERSION}
 # Copy venv from builder
 COPY --from=builder --chown=${uid}:${gid} /app/.venv /app/.venv
 # Copy application files
-COPY --chown=${uid}:${gid} proxy.py start.sh ./
+COPY --chown=${uid}:${gid} proxy.py logtee.py start.sh ./
 RUN chmod +x start.sh
 # Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"
