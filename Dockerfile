@@ -1,5 +1,5 @@
 # Base image
-FROM python:3.14.5-slim@sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fad06a2fb068e97 AS base
+FROM python:3.15.0b2-slim@sha256:4c6413e9d36127c1322ef2e602b0a680dd726be10f9c2c3265b6928807810841 AS base
 # UID/GID for non-root user (https://github.com/hexops/dockerfile#do-not-use-a-uid-below-10000)
 ARG uid=10001
 ARG gid=10001
