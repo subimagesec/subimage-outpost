@@ -106,7 +106,10 @@ def _sanitize_target(target: str) -> str:
         # Not a URL we can take apart, so do not risk echoing it verbatim.
         return "<redacted PROXY_TARGET>"
 
-    netloc = f"{hostname}:{port}" if port else hostname
+    # urlsplit strips the brackets off an IPv6 literal, and putting it back
+    # bare would render https://[::1]:8443 as the ambiguous https://::1:8443.
+    display_host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = f"{display_host}:{port}" if port is not None else display_host
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 

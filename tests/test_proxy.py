@@ -322,6 +322,10 @@ def test_sanitize_target_strips_credentials(monkeypatch):
         == "https://kubernetes.default.svc"
     )
     assert proxy._sanitize_target("http://10.0.0.1:6443") == "http://10.0.0.1:6443"
+    # urlsplit drops the brackets off an IPv6 literal; rebuilding without them
+    # would emit the ambiguous https://::1:8443.
+    assert proxy._sanitize_target("https://[::1]:8443/api") == "https://[::1]:8443/api"
+    assert proxy._sanitize_target("https://[fd00::1]/api") == "https://[fd00::1]/api"
     # Anything we cannot take apart is never echoed verbatim.
     assert proxy._sanitize_target("not a url") == "<redacted PROXY_TARGET>"
 
