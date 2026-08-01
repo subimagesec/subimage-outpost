@@ -1,8 +1,10 @@
 import logging
 import os
 import ssl
+from collections.abc import AsyncIterator
 from collections.abc import Iterator
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from itertools import islice
 from pathlib import Path
 
@@ -11,8 +13,8 @@ from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
+from fastapi.responses import JSONResponse
 
-app = FastAPI()
 logger = logging.getLogger(__name__)
 
 # Build-time version, injected via the OUTPOST_VERSION env var (set from the git
@@ -45,6 +47,13 @@ TARGET = os.environ.get("PROXY_TARGET")  # e.g. "https://snipeit.internal.local"
 TARGET_HOST = os.environ.get("PROXY_HOST")  # optional: override Host header
 VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
 
+# Same derivation start.sh uses for the tailnet hostname, recomputed here (it is
+# only a shell local there) so upstream failures can name the outpost the
+# operator sees on the outposts settings page.
+OUTPOST_NAME = os.environ.get("NAME", "subimage")
+TENANT_ID = os.environ.get("TENANT_ID")
+OUTPOST_HOSTNAME = f"{TENANT_ID}-{OUTPOST_NAME}-outpost" if TENANT_ID else OUTPOST_NAME
+
 # Default to the in-cluster Kubernetes serviceaccount CA bundle if present;
 # users can override with CA_BUNDLE for non-kube self-signed targets.
 DEFAULT_K8S_CA_BUNDLE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -68,6 +77,42 @@ else:
 
 if not TARGET:
     raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    """Read a positive float from the environment, falling back on bad input.
+
+    A typo here should not crashloop an otherwise-working outpost, so this warns
+    and uses the default rather than raising the way the CA bundle check does.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+
+    if value <= 0:
+        print(f"Ignoring invalid {name}={raw!r}; using {default}")
+        return default
+
+    return value
+
+
+# httpx defaults every phase to 5s. That is shorter than a degraded CoreDNS
+# ndots:5 search-domain fanout takes to resolve kubernetes.default.svc, and far
+# shorter than a large `list` call across a big cluster. Both are tunable so a
+# slow cluster can be adjusted without shipping a new image.
+CONNECT_TIMEOUT = _positive_float_env("PROXY_CONNECT_TIMEOUT", 15.0)
+READ_TIMEOUT = _positive_float_env("PROXY_READ_TIMEOUT", 60.0)
+TIMEOUT = httpx.Timeout(
+    connect=CONNECT_TIMEOUT,
+    read=READ_TIMEOUT,
+    write=READ_TIMEOUT,
+    pool=READ_TIMEOUT,
+)
 
 # Load static bearer tokens from the environment once. File-backed tokens are
 # read per request because Kubernetes projected ServiceAccount tokens rotate.
@@ -152,6 +197,22 @@ def build_proxy_headers(request_headers: Mapping[str, str]) -> dict[str, str]:
     return headers
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Hold a single httpx client for the process lifetime.
+
+    Building one per request meant a fresh TLS handshake on every proxied call
+    and no connection pooling at all, which a Cartography sync pays for on every
+    one of its many sequential API calls.
+    """
+    async with httpx.AsyncClient(verify=VERIFY, timeout=TIMEOUT) as client:
+        app.state.client = client
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
 # Internal endpoints. These must be declared before the catch-all proxy route
 # below, otherwise it would swallow them. Authentication is handled at the
 # network layer: uvicorn binds to 127.0.0.1, so the only ingress is
@@ -224,14 +285,53 @@ async def proxy(request: Request, path: str):
 
     url = f"{TARGET.rstrip('/')}/{path}"
     headers = build_proxy_headers(request.headers)
+    client: httpx.AsyncClient = request.app.state.client
 
-    async with httpx.AsyncClient(verify=VERIFY) as client:
+    try:
         proxied_response = await client.request(
             method=request.method,
             url=url,
             headers=headers,
             content=await request.body(),
             params=request.query_params,
+        )
+    except httpx.TransportError as exc:
+        # Never getting an answer from upstream (timed out, refused, or the name
+        # would not resolve) is a gateway timeout; any other transport-level
+        # failure is a bad gateway.
+        if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+            status_code = 504
+            message = (
+                "Outpost could not reach its proxy target "
+                f"(connect timeout {CONNECT_TIMEOUT}s, read timeout {READ_TIMEOUT}s)"
+            )
+        else:
+            status_code = 502
+            message = "Outpost failed to proxy the request to its target"
+
+        # httpx raises some of these with an empty message, so only append one
+        # when there is something to say.
+        detail = type(exc).__name__
+        if str(exc):
+            detail = f"{detail}: {exc}"
+
+        # A warning, not a traceback: this is tee'd to OUTPOST_LOG_FILE and read
+        # back through /_internal/logs and the outposts settings page.
+        logger.warning("%s: %s: %s", message, TARGET, detail)
+
+        # Deliberately not a Kubernetes `Status` object: the backend tells an
+        # outpost-side failure apart from a genuine API server 5xx by checking
+        # that the body is not one (see _is_outpost_upstream_failure in
+        # subimage-backend/app/sync/modules/kubernetes.py).
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "error": message,
+                "outpost": OUTPOST_HOSTNAME,
+                "target": TARGET,
+                "detail": detail,
+                "version": OUTPOST_VERSION,
+            },
         )
 
     # Filter hop-by-hop headers from response
