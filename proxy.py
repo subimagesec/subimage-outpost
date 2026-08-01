@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import ssl
 from collections.abc import AsyncIterator
@@ -7,6 +8,8 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from itertools import islice
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 import httpx
 from fastapi import FastAPI
@@ -79,11 +82,42 @@ if not TARGET:
     raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
 
 
+def _sanitize_target(target: str) -> str:
+    """Strip anything secret-shaped out of PROXY_TARGET before it is echoed.
+
+    Auth is meant to travel via BEARER_TOKEN, but nothing stops a target from
+    carrying URL userinfo or a token in its query string, and upstream failures
+    put this value in both the response body and OUTPOST_LOG_FILE, which is
+    served by /_internal/logs and rendered on the outposts settings page.
+    Scheme, host, port and path are enough to diagnose a connection failure, so
+    drop userinfo, query and fragment wholesale rather than guessing which
+    parameters are sensitive.
+    """
+    try:
+        parts = urlsplit(target)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return "<unparseable PROXY_TARGET>"
+
+    if not parts.scheme or not hostname:
+        # Not a URL we can take apart, so do not risk echoing it verbatim.
+        return "<redacted PROXY_TARGET>"
+
+    netloc = f"{hostname}:{port}" if port else hostname
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+SAFE_TARGET = _sanitize_target(TARGET)
+
+
 def _positive_float_env(name: str, default: float) -> float:
-    """Read a positive float from the environment, falling back on bad input.
+    """Read a finite positive float from the environment, falling back on bad input.
 
     A typo here should not crashloop an otherwise-working outpost, so this warns
     and uses the default rather than raising the way the CA bundle check does.
+    float() also accepts "nan" and "inf", which would sail past a plain `<= 0`
+    check and reach httpx as a timeout that never fires.
     """
     raw = os.environ.get(name)
     if not raw:
@@ -94,7 +128,7 @@ def _positive_float_env(name: str, default: float) -> float:
     except ValueError:
         value = 0.0
 
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         print(f"Ignoring invalid {name}={raw!r}; using {default}")
         return default
 
@@ -317,7 +351,7 @@ async def proxy(request: Request, path: str):
 
         # A warning, not a traceback: this is tee'd to OUTPOST_LOG_FILE and read
         # back through /_internal/logs and the outposts settings page.
-        logger.warning("%s: %s: %s", message, TARGET, detail)
+        logger.warning("%s: %s: %s", message, SAFE_TARGET, detail)
 
         # Deliberately not a Kubernetes `Status` object: the backend tells an
         # outpost-side failure apart from a genuine API server 5xx by checking
@@ -328,7 +362,7 @@ async def proxy(request: Request, path: str):
             content={
                 "error": message,
                 "outpost": OUTPOST_HOSTNAME,
-                "target": TARGET,
+                "target": SAFE_TARGET,
                 "detail": detail,
                 "version": OUTPOST_VERSION,
             },

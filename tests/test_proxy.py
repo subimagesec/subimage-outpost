@@ -299,6 +299,57 @@ def test_invalid_timeout_falls_back_to_default(monkeypatch):
     assert proxy.TIMEOUT.read == 60.0
 
 
+def test_non_finite_timeout_falls_back_to_default(monkeypatch):
+    # float() happily parses these, and a bare `<= 0` check lets them through
+    # to httpx as a timeout that never fires.
+    for raw in ("nan", "inf", "-inf", "Infinity"):
+        proxy = load_proxy(monkeypatch, env={"PROXY_CONNECT_TIMEOUT": raw})
+
+        assert proxy.TIMEOUT.connect == 15.0, raw
+
+
+def test_sanitize_target_strips_credentials(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+
+    # Userinfo and query strings are the two places a secret can hide.
+    assert (
+        proxy._sanitize_target("https://user:pa55@snipeit.internal/api?token=abc")
+        == "https://snipeit.internal/api"
+    )
+    # A plain target is passed through unchanged, port included.
+    assert (
+        proxy._sanitize_target("https://kubernetes.default.svc")
+        == "https://kubernetes.default.svc"
+    )
+    assert proxy._sanitize_target("http://10.0.0.1:6443") == "http://10.0.0.1:6443"
+    # Anything we cannot take apart is never echoed verbatim.
+    assert proxy._sanitize_target("not a url") == "<redacted PROXY_TARGET>"
+
+
+def test_upstream_failure_does_not_leak_target_credentials(monkeypatch, caplog):
+    proxy = load_proxy(
+        monkeypatch,
+        env={"PROXY_TARGET": "https://svc:hunter2@internal.local/base?apikey=s3cret"},
+    )
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(
+            proxy.app.state.client,
+            "request",
+            raise_on_request(httpx.ConnectTimeout("timed out")),
+        )
+        with caplog.at_level(logging.WARNING, logger="proxy"):
+            response = client.get("/api/v1/namespaces/kube-system")
+
+    body = response.json()
+    assert body["target"] == "https://internal.local/base"
+
+    # The body and the log line are both readable from the settings page.
+    serialized = response.text + "".join(r.getMessage() for r in caplog.records)
+    assert "hunter2" not in serialized
+    assert "s3cret" not in serialized
+
+
 def test_connect_timeout_returns_504(monkeypatch):
     proxy = load_proxy(monkeypatch)
 
