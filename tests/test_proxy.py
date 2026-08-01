@@ -366,7 +366,8 @@ def test_connect_timeout_returns_504(monkeypatch):
 
     body = response.json()
     assert body["target"] == "https://kubernetes.default.svc"
-    assert body["outpost"] == "subimage"
+    # start.sh passes `--hostname proxy` when TENANT_ID is unset.
+    assert body["outpost"] == "proxy"
     assert "ConnectTimeout" in body["detail"]
     # The backend classifies an outpost 5xx as "Cluster API Server Unreachable"
     # precisely because the body is not a Kubernetes `Status` object.
@@ -421,6 +422,25 @@ def test_transport_failure_logs_one_warning_without_traceback(monkeypatch, caplo
     assert len(records) == 1
     assert records[0].exc_info is None
     assert "ConnectTimeout" in records[0].getMessage()
+
+
+def test_invalid_target_url_returns_502_not_an_opaque_500(monkeypatch):
+    # httpx.InvalidURL is a bare Exception, not a TransportError, so a bad port
+    # in PROXY_TARGET used to escape the handler as a 500 plus a traceback.
+    proxy = load_proxy(
+        monkeypatch, env={"PROXY_TARGET": "https://kubernetes.default.svc:notaport"}
+    )
+
+    with TestClient(proxy.app) as client:
+        response = client.get("/api/v1/namespaces/kube-system")
+
+    assert response.status_code == 502
+
+    body = response.json()
+    assert "InvalidURL" in body["detail"]
+    # Names the configuration, not the network: a different fix for the reader.
+    assert "valid URL" in body["error"]
+    assert "kind" not in body
 
 
 def test_outpost_identity_uses_tailnet_hostname(monkeypatch):

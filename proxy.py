@@ -52,10 +52,12 @@ VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
 
 # Same derivation start.sh uses for the tailnet hostname, recomputed here (it is
 # only a shell local there) so upstream failures can name the outpost the
-# operator sees on the outposts settings page.
+# operator sees on the outposts settings page. start.sh only builds a hostname
+# when TENANT_ID is set and otherwise passes `--hostname proxy`, so the fallback
+# has to be "proxy" and not NAME, which would name a node nobody can find.
 OUTPOST_NAME = os.environ.get("NAME", "subimage")
 TENANT_ID = os.environ.get("TENANT_ID")
-OUTPOST_HOSTNAME = f"{TENANT_ID}-{OUTPOST_NAME}-outpost" if TENANT_ID else OUTPOST_NAME
+OUTPOST_HOSTNAME = f"{TENANT_ID}-{OUTPOST_NAME}-outpost" if TENANT_ID else "proxy"
 
 # Default to the in-cluster Kubernetes serviceaccount CA bundle if present;
 # users can override with CA_BUNDLE for non-kube self-signed targets.
@@ -329,7 +331,10 @@ async def proxy(request: Request, path: str):
             content=await request.body(),
             params=request.query_params,
         )
-    except httpx.TransportError as exc:
+    # InvalidURL is a bare Exception rather than a TransportError, so a
+    # PROXY_TARGET with something like a bad port would otherwise escape as the
+    # opaque 500 this handler exists to eliminate.
+    except (httpx.TransportError, httpx.InvalidURL) as exc:
         # Never getting an answer from upstream (timed out, refused, or the name
         # would not resolve) is a gateway timeout; any other transport-level
         # failure is a bad gateway.
@@ -339,6 +344,11 @@ async def proxy(request: Request, path: str):
                 "Outpost could not reach its proxy target "
                 f"(connect timeout {CONNECT_TIMEOUT}s, read timeout {READ_TIMEOUT}s)"
             )
+        elif isinstance(exc, httpx.InvalidURL):
+            # Points at the configuration rather than the network, which is a
+            # different fix for whoever reads this.
+            status_code = 502
+            message = "Outpost could not build a valid URL for its proxy target"
         else:
             status_code = 502
             message = "Outpost failed to proxy the request to its target"
