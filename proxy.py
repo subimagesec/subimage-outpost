@@ -366,10 +366,10 @@ async def proxy(request: Request, path: str):
         # back through /_internal/logs and the outposts settings page.
         logger.warning("%s: %s: %s", message, SAFE_TARGET, detail)
 
-        # Deliberately not a Kubernetes `Status` object: the backend tells an
-        # outpost-side failure apart from a genuine API server 5xx by checking
-        # that the body is not one (see _is_outpost_upstream_failure in
-        # subimage-backend/app/sync/modules/kubernetes.py).
+        # `outpost` and `target` are a contract: SubImage reads them to tell an
+        # outpost-side failure apart from a genuine API server 5xx, and pairs the
+        # status with a remediation (504 unreachable, 502 proxy misconfigured).
+        # Keep both keys, and keep the body distinct from a Kubernetes `Status`.
         return JSONResponse(
             status_code=status_code,
             content={
