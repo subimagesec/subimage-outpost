@@ -26,6 +26,8 @@ This container runs:
 | `CA_BUNDLE`           | Path to a CA bundle file used to verify TLS (only honored when `VERIFY_TLS=true`). If unset, defaults to the Kubernetes serviceaccount CA at `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` when that file exists. | _None_ |
 | `BEARER_TOKEN`        | Bearer token for authentication (added to Authorization header) | _None_  |
 | `BEARER_TOKEN_PATH`   | Path to file containing bearer token                        | _None_      |
+| `PROXY_CONNECT_TIMEOUT` | Seconds to wait for a TCP/TLS connection to `PROXY_TARGET`. Raise it when cluster DNS is slow (a degraded CoreDNS with `ndots:5` search-domain fanout can take a while to resolve `kubernetes.default.svc`). | `15` |
+| `PROXY_READ_TIMEOUT`  | Seconds to wait for the target's response; also applied to the write and pool timeouts. Raise it for large `list` calls against a big cluster. | `60` |
 
 The `TENANT_ID`, `ENVIRONMENT`, and `NAME` automatically configure:
 - Tailscale hostname: `{TENANT_ID}-{NAME}-outpost`

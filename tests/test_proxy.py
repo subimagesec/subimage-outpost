@@ -1,22 +1,38 @@
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 
-def load_proxy(monkeypatch, token_path: Path | None = None, token: str | None = None):
+def load_proxy(
+    monkeypatch,
+    token_path: Path | None = None,
+    token: str | None = None,
+    env: dict[str, str] | None = None,
+):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     monkeypatch.setenv("PROXY_TARGET", "https://kubernetes.default.svc")
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     monkeypatch.delenv("BEARER_TOKEN_PATH", raising=False)
     monkeypatch.delenv("CA_BUNDLE", raising=False)
+    # NAME and TENANT_ID feed the outpost identity in upstream-failure bodies,
+    # and NAME is generic enough to leak in from a developer's shell.
+    monkeypatch.delenv("NAME", raising=False)
+    monkeypatch.delenv("TENANT_ID", raising=False)
+    monkeypatch.delenv("PROXY_CONNECT_TIMEOUT", raising=False)
+    monkeypatch.delenv("PROXY_READ_TIMEOUT", raising=False)
 
     if token is not None:
         monkeypatch.setenv("BEARER_TOKEN", token)
     if token_path is not None:
         monkeypatch.setenv("BEARER_TOKEN_PATH", str(token_path))
+    # Applied last so a test can set vars the isolation block above clears.
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
 
     sys.modules.pop("proxy", None)
     import proxy
@@ -239,6 +255,242 @@ def test_logtee_tees_and_rotates(tmp_path):
 
     # The active file holds the most recent line.
     assert "line 29" in log_file.read_text()
+
+
+def raise_on_request(exc: Exception):
+    """Stub for AsyncClient.request that always fails with `exc`."""
+
+    async def _request(*args, **kwargs):
+        raise exc
+
+    return _request
+
+
+def test_timeout_defaults(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+
+    # Not httpx's 5s default, which is shorter than a degraded CoreDNS lookup.
+    assert proxy.TIMEOUT.connect == 15.0
+    assert proxy.TIMEOUT.read == 60.0
+    assert proxy.TIMEOUT.write == 60.0
+    assert proxy.TIMEOUT.pool == 60.0
+
+
+def test_timeouts_are_env_configurable(monkeypatch):
+    proxy = load_proxy(
+        monkeypatch,
+        env={"PROXY_CONNECT_TIMEOUT": "3", "PROXY_READ_TIMEOUT": "7.5"},
+    )
+
+    assert proxy.TIMEOUT.connect == 3.0
+    assert proxy.TIMEOUT.read == 7.5
+    assert proxy.TIMEOUT.write == 7.5
+    assert proxy.TIMEOUT.pool == 7.5
+
+
+def test_invalid_timeout_falls_back_to_default(monkeypatch):
+    # A typo must not crashloop an otherwise-working outpost.
+    proxy = load_proxy(
+        monkeypatch,
+        env={"PROXY_CONNECT_TIMEOUT": "abc", "PROXY_READ_TIMEOUT": "-1"},
+    )
+
+    assert proxy.TIMEOUT.connect == 15.0
+    assert proxy.TIMEOUT.read == 60.0
+
+
+def test_non_finite_timeout_falls_back_to_default(monkeypatch):
+    # float() happily parses these, and a bare `<= 0` check lets them through
+    # to httpx as a timeout that never fires.
+    for raw in ("nan", "inf", "-inf", "Infinity"):
+        proxy = load_proxy(monkeypatch, env={"PROXY_CONNECT_TIMEOUT": raw})
+
+        assert proxy.TIMEOUT.connect == 15.0, raw
+
+
+def test_sanitize_target_strips_credentials(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+
+    # Userinfo and query strings are the two places a secret can hide.
+    assert (
+        proxy._sanitize_target("https://user:pa55@snipeit.internal/api?token=abc")
+        == "https://snipeit.internal/api"
+    )
+    # A plain target is passed through unchanged, port included.
+    assert (
+        proxy._sanitize_target("https://kubernetes.default.svc")
+        == "https://kubernetes.default.svc"
+    )
+    assert proxy._sanitize_target("http://10.0.0.1:6443") == "http://10.0.0.1:6443"
+    # urlsplit drops the brackets off an IPv6 literal; rebuilding without them
+    # would emit the ambiguous https://::1:8443.
+    assert proxy._sanitize_target("https://[::1]:8443/api") == "https://[::1]:8443/api"
+    assert proxy._sanitize_target("https://[fd00::1]/api") == "https://[fd00::1]/api"
+    # Anything we cannot take apart is never echoed verbatim.
+    assert proxy._sanitize_target("not a url") == "<redacted PROXY_TARGET>"
+
+
+def test_upstream_failure_does_not_leak_target_credentials(monkeypatch, caplog):
+    proxy = load_proxy(
+        monkeypatch,
+        env={"PROXY_TARGET": "https://svc:hunter2@internal.local/base?apikey=s3cret"},
+    )
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(
+            proxy.app.state.client,
+            "request",
+            raise_on_request(httpx.ConnectTimeout("timed out")),
+        )
+        with caplog.at_level(logging.WARNING, logger="proxy"):
+            response = client.get("/api/v1/namespaces/kube-system")
+
+    body = response.json()
+    assert body["target"] == "https://internal.local/base"
+
+    # The body and the log line are both readable from the settings page.
+    serialized = response.text + "".join(r.getMessage() for r in caplog.records)
+    assert "hunter2" not in serialized
+    assert "s3cret" not in serialized
+
+
+def test_connect_timeout_returns_504(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(
+            proxy.app.state.client,
+            "request",
+            raise_on_request(httpx.ConnectTimeout("timed out")),
+        )
+        response = client.get("/api/v1/namespaces/kube-system")
+
+    assert response.status_code == 504
+    assert response.headers["content-type"].startswith("application/json")
+
+    body = response.json()
+    assert body["target"] == "https://kubernetes.default.svc"
+    # start.sh passes `--hostname proxy` when TENANT_ID is unset.
+    assert body["outpost"] == "proxy"
+    assert "ConnectTimeout" in body["detail"]
+    # The backend classifies an outpost 5xx as "Cluster API Server Unreachable"
+    # precisely because the body is not a Kubernetes `Status` object.
+    assert "kind" not in body
+
+
+def test_connect_error_and_read_timeout_return_504(monkeypatch):
+    for exc in (httpx.ConnectError("name not resolved"), httpx.ReadTimeout("slow")):
+        proxy = load_proxy(monkeypatch)
+
+        with TestClient(proxy.app) as client:
+            monkeypatch.setattr(
+                proxy.app.state.client, "request", raise_on_request(exc)
+            )
+            response = client.get("/api/v1/namespaces/kube-system")
+
+        assert response.status_code == 504, exc
+        assert "kind" not in response.json()
+
+
+def test_other_transport_error_returns_502(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(
+            proxy.app.state.client,
+            "request",
+            raise_on_request(httpx.RemoteProtocolError("bad chunk")),
+        )
+        response = client.get("/api/v1/namespaces/kube-system")
+
+    assert response.status_code == 502
+
+    body = response.json()
+    assert "RemoteProtocolError" in body["detail"]
+    assert "kind" not in body
+
+
+def test_transport_failure_logs_one_warning_without_traceback(monkeypatch, caplog):
+    proxy = load_proxy(monkeypatch)
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(
+            proxy.app.state.client,
+            "request",
+            raise_on_request(httpx.ConnectTimeout("timed out")),
+        )
+        with caplog.at_level(logging.WARNING, logger="proxy"):
+            client.get("/api/v1/namespaces/kube-system")
+
+    records = [record for record in caplog.records if record.name == "proxy"]
+    assert len(records) == 1
+    assert records[0].exc_info is None
+    assert "ConnectTimeout" in records[0].getMessage()
+
+
+def test_invalid_target_url_returns_502_not_an_opaque_500(monkeypatch):
+    # httpx.InvalidURL is a bare Exception, not a TransportError, so a bad port
+    # in PROXY_TARGET used to escape the handler as a 500 plus a traceback.
+    proxy = load_proxy(
+        monkeypatch, env={"PROXY_TARGET": "https://kubernetes.default.svc:notaport"}
+    )
+
+    with TestClient(proxy.app) as client:
+        response = client.get("/api/v1/namespaces/kube-system")
+
+    assert response.status_code == 502
+
+    body = response.json()
+    assert "InvalidURL" in body["detail"]
+    # Names the configuration, not the network: a different fix for the reader.
+    assert "valid URL" in body["error"]
+    assert "kind" not in body
+
+
+def test_outpost_identity_uses_tailnet_hostname(monkeypatch):
+    proxy = load_proxy(monkeypatch, env={"TENANT_ID": "acme", "NAME": "eks-prod"})
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(
+            proxy.app.state.client,
+            "request",
+            raise_on_request(httpx.ConnectTimeout("timed out")),
+        )
+        response = client.get("/api/v1/namespaces/kube-system")
+
+    assert response.json()["outpost"] == "acme-eks-prod-outpost"
+
+
+def test_single_client_is_reused_across_requests(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+
+    constructed = []
+
+    class CountingClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            constructed.append(self)
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", CountingClient)
+
+    calls = []
+
+    async def fake_request(*args, **kwargs):
+        calls.append(kwargs["url"])
+        return httpx.Response(200, json={"ok": True})
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(proxy.app.state.client, "request", fake_request)
+
+        assert client.get("/api/v1/namespaces/kube-system").status_code == 200
+        assert client.get("/api/v1/nodes").json() == {"ok": True}
+
+    # One client for the process, not one per proxied request.
+    assert len(constructed) == 1
+    assert calls == [
+        "https://kubernetes.default.svc/api/v1/namespaces/kube-system",
+        "https://kubernetes.default.svc/api/v1/nodes",
+    ]
 
 
 def test_logtee_rejects_non_positive_config(monkeypatch):
