@@ -5,9 +5,9 @@ description = "HTTP proxy with bearer token authentication"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi>=0.140.13",
+    "fastapi>=0.141.1",
     "httpx>=0.28.0",
-    "uvicorn>=0.51.0",
+    "uvicorn>=0.52.1",
 ]
 
 [dependency-groups]
