@@ -1,17 +1,20 @@
+# syntax=docker/dockerfile:1.7
+
+# Pin updated by Dependabot (docker ecosystem, /).
+FROM tailscale/tailscale:v1.102.4@sha256:2667499ed87ae29218f292556ba062918402dd5e92e93637af14867e4df12dd3 AS tailscale
+
 # Base image
 FROM python:3.14.7-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS base
 # UID/GID for non-root user (https://github.com/hexops/dockerfile#do-not-use-a-uid-below-10000)
 ARG uid=10001
 ARG gid=10001
-# Install system dependencies and Tailscale
+# Install system dependencies (Tailscale binaries come from the pinned stage above)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl iproute2 iputils-ping gnupg ca-certificates && \
-    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.gpg | gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian bookworm main" > /etc/apt/sources.list.d/tailscale.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends tailscale && \
+    apt-get install -y --no-install-recommends curl iproute2 iputils-ping ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
 # Create non-root user and app directory
 RUN groupadd --gid ${gid} outpost && \
     useradd --uid ${uid} --gid ${gid} --create-home outpost
