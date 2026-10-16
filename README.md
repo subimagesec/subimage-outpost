@@ -56,7 +56,7 @@ If either variable is set, the proxy automatically adds an `Authorization: Beare
 ```bash
 docker build -t proxy .
 
-docker run --rm \
+docker run -d --restart unless-stopped \
   -e TAILSCALE_AUTHKEY=tskey-client-abc123?ephemeral=true \
   -e TENANT_ID=acme \
   -e ENVIRONMENT=prod \
@@ -76,7 +76,7 @@ Deploy separate outposts for different networks/services:
 ```bash
 docker build -t proxy .
 
-docker run --rm \
+docker run -d --restart unless-stopped \
   -e TAILSCALE_AUTHKEY=tskey-client-abc123?ephemeral=true \
   -e TENANT_ID=acme \
   -e ENVIRONMENT=prod \
@@ -91,7 +91,7 @@ Tags: `tag:acme-prod-outpost`
 ```bash
 docker build -t proxy .
 
-docker run --rm \
+docker run -d --restart unless-stopped \
   -e TAILSCALE_AUTHKEY=tskey-client-abc123?ephemeral=true \
   -e TENANT_ID=acme \
   -e ENVIRONMENT=prod \
@@ -106,7 +106,7 @@ All outposts for a tenant+environment share the same OAuth secret and Tailscale 
 
 ### Restarts
 
-The container exits when its proxy process dies, so run it under a restart policy: `--restart unless-stopped` with `docker run` (instead of `--rm`), `restart: unless-stopped` in Docker Compose, or a Deployment on Kubernetes. Without one, the outpost stays down until someone restarts it.
+The container exits when its proxy process dies, so run it under a restart policy, as the examples above do: `--restart unless-stopped` with `docker run` (instead of `--rm`), `restart: unless-stopped` in Docker Compose, or a Deployment on Kubernetes. Without one, the outpost stays down until someone restarts it.
 
 ---
 
