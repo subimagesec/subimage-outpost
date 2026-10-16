@@ -74,6 +74,7 @@ echo "Connected to Tailscale"
 # Start proxy
 echo "Starting proxy server on port ${PROXY_PORT}..."
 cd /app && uvicorn proxy:app --host 127.0.0.1 --port ${PROXY_PORT} &
+PROXY_PID=$!
 
 sleep 2
 
@@ -82,8 +83,15 @@ echo "Exposing proxy via Tailscale serve..."
 tailscale serve --bg --http ${TAILSCALE_SERVE_PORT} http://localhost:${PROXY_PORT}
 echo "Outpost is ready and serving"
 
-# Keep alive (using wait so trap can catch signals)
-while true; do
-    sleep 86400 &
-    wait $!
-done
+# Once the proxy is gone, tailscale serve answers every request with an empty
+# 502 while the node stays online, so the outpost looks healthy from the tailnet
+# and fails every sync until someone restarts it. Exit with the proxy instead so
+# the container's restart policy brings it back. wait also returns when a signal
+# interrupts it, after the trap has run.
+proxy_status=0
+wait "$PROXY_PID" || proxy_status=$?
+if [ "$_cleaned" = "1" ]; then
+    exit "$proxy_status"
+fi
+echo "ERROR: proxy exited with status ${proxy_status}; stopping the outpost so it restarts"
+exit 1

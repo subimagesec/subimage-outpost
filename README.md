@@ -104,6 +104,10 @@ Tags: `tag:acme-prod-outpost`
 
 All outposts for a tenant+environment share the same OAuth secret and Tailscale tag - just use different `NAME` values to get unique hostnames.
 
+### Restarts
+
+The container exits when its proxy process dies, so run it under a restart policy: `--restart unless-stopped` with `docker run` (instead of `--rm`), `restart: unless-stopped` in Docker Compose, or a Deployment on Kubernetes. Without one, the outpost stays down until someone restarts it.
+
 ---
 
 ## Releasing a New Version
