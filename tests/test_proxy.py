@@ -1,5 +1,6 @@
 import logging
 import os
+import ssl
 import subprocess
 import sys
 from pathlib import Path
@@ -545,3 +546,135 @@ def test_internal_routes_not_proxied(monkeypatch):
 
     assert response.status_code == 200
     assert "version" in response.json()
+
+
+# Fingerprints computed the way Cartography fingerprints an EKS cluster CA:
+# cryptography's load_pem_x509_certificate(...).fingerprint(SHA256()).hex().
+CA_A_PEM = """-----BEGIN CERTIFICATE-----
+MIIBYTCCAQagAwIBAgIUQpztTQdgxOLHNZrJFIH0D5z88WgwCgYIKoZIzj0EAwIw
+FTETMBEGA1UEAwwKa3ViZXJuZXRlczAgFw0yNjEwMjcxNDQ5NTVaGA8yMTI2MTAw
+MzE0NDk1NVowFTETMBEGA1UEAwwKa3ViZXJuZXRlczBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABCcVsdo4/sWPjF+Cvt5k5+INwRHS9DdoUZ46jZxaZ4xI4GfSSc3b
+ZcwHubM88OvxVGf1TQDHzMVUUHwPB0bBYDajMjAwMB0GA1UdDgQWBBQjra2/tONy
+OK3n1W7WOgF8qrCJfjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYC
+IQDkwFeWEAUyjRH9BvYpIInF0NPg4BPgrWPhoRHmZ31qNwIhALLkMN08aq/17dwt
+fGrB1CGAekLo1KR+zO3volQk+bAv
+-----END CERTIFICATE-----
+"""
+CA_A_SHA256 = "e23ae51854663ba63a26077678f2c5d63751292b882c1bc3e85e4922b7e0c293"
+CA_B_PEM = """-----BEGIN CERTIFICATE-----
+MIIBYDCCAQagAwIBAgIUB9/TvDp3BtgyT+CbZknRrhvYU+owCgYIKoZIzj0EAwIw
+FTETMBEGA1UEAwwKa3ViZXJuZXRlczAgFw0yNjEwMjcxNDQ5NTVaGA8yMTI2MTAw
+MzE0NDk1NVowFTETMBEGA1UEAwwKa3ViZXJuZXRlczBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABOLzV9gKrxN55CpVxioCTdW2tcbAfkC0D+KecOMOPhf7+nrrCyDi
++miocU0mWQXoNSKnEGxik77E7Gn8qyfBxK2jMjAwMB0GA1UdDgQWBBR1A1D2pIf0
+rWnv98yP7PYA89QDeTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUC
+IC2lx+6J6guoFTVjr/RCOY/bEJnyaeVeOm6ES9WnkRKjAiEA0BAaWCShYZoXM6Vm
+zfMJQYQMhzcLIn3CAv6opMJgjXQ=
+-----END CERTIFICATE-----
+"""
+CA_B_SHA256 = "835a92aad5b09af1a6678c8913fc98c63cded070492834f7c74d73b5f650f695"
+
+
+def load_identity_proxy(monkeypatch, tmp_path, ca_pem, handler, env=None):
+    proxy = load_proxy(monkeypatch, env=env)
+    ca_path = tmp_path / "ca.crt"
+    ca_path.write_text(ca_pem)
+    monkeypatch.setattr(proxy, "SERVICE_ACCOUNT_CA_PATH", ca_path)
+    calls = []
+
+    def recording_handler(request):
+        calls.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        proxy,
+        "identity_client",
+        lambda _ca_path: httpx.AsyncClient(
+            transport=httpx.MockTransport(recording_handler)
+        ),
+    )
+    return proxy, calls
+
+
+def test_identity_reports_verified_kubernetes_target(monkeypatch, tmp_path):
+    proxy, calls = load_identity_proxy(
+        monkeypatch,
+        tmp_path,
+        CA_A_PEM + CA_B_PEM,
+        lambda _request: httpx.Response(
+            200, json={"gitVersion": "v1.31.2-eks-7f9249a"}
+        ),
+        env={"TENANT_ID": "acme", "NAME": "prod", "BEARER_TOKEN": "sa-token"},
+    )
+
+    body = TestClient(proxy.app).get("/_internal/identity").json()
+
+    assert body["hostname"] == "acme-prod-outpost"
+    assert body["reason"] is None
+    assert body["kubernetes"] == {
+        "ca_sha256": [CA_A_SHA256, CA_B_SHA256],
+        "target_tls_verified": True,
+        "git_version": "v1.31.2-eks-7f9249a",
+        "platform": "eks",
+    }
+    assert str(calls[0].url) == "https://kubernetes.default.svc/version"
+    assert calls[0].headers["authorization"] == "Bearer sa-token"
+
+
+def test_identity_withholds_fingerprint_when_target_tls_fails(monkeypatch, tmp_path):
+    def handler(_request):
+        raise httpx.ConnectError("handshake failed") from ssl.SSLCertVerificationError(
+            "certificate verify failed"
+        )
+
+    proxy, _ = load_identity_proxy(monkeypatch, tmp_path, CA_A_PEM, handler)
+
+    body = TestClient(proxy.app).get("/_internal/identity").json()
+
+    assert body["kubernetes"] is None
+    assert body["reason"] == "target_tls_unverified"
+
+
+def test_identity_withholds_fingerprint_for_non_kubernetes_target(
+    monkeypatch, tmp_path
+):
+    proxy, _ = load_identity_proxy(
+        monkeypatch,
+        tmp_path,
+        CA_A_PEM,
+        lambda _request: httpx.Response(200, text="<html>Snipe-IT</html>"),
+    )
+
+    body = TestClient(proxy.app).get("/_internal/identity").json()
+
+    assert body["kubernetes"] is None
+    assert body["reason"] == "target_not_kubernetes"
+
+
+def test_identity_without_service_account_ca(monkeypatch, tmp_path):
+    proxy = load_proxy(monkeypatch)
+    monkeypatch.setattr(proxy, "SERVICE_ACCOUNT_CA_PATH", tmp_path / "missing.crt")
+
+    body = TestClient(proxy.app).get("/_internal/identity").json()
+
+    assert body["kubernetes"] is None
+    assert body["reason"] == "no_service_account_ca"
+
+
+def test_identity_caches_only_successful_lookups(monkeypatch, tmp_path):
+    responses = iter(
+        [
+            httpx.Response(503),
+            httpx.Response(200, json={"gitVersion": "v1.30.5-gke.1014001"}),
+        ]
+    )
+    proxy, calls = load_identity_proxy(
+        monkeypatch, tmp_path, CA_A_PEM, lambda _request: next(responses)
+    )
+    client = TestClient(proxy.app)
+
+    assert client.get("/_internal/identity").json()["kubernetes"] is None
+    assert client.get("/_internal/identity").json()["kubernetes"]["platform"] == "gke"
+    assert client.get("/_internal/identity").json()["kubernetes"]["platform"] == "gke"
+    assert len(calls) == 2
