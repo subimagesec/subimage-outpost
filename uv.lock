@@ -377,7 +377,7 @@ wheels = [
 
 [[package]]
 name = "subimage-outpost"
-version = "1.2.3"
+version = "1.2.4"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
