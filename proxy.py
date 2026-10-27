@@ -1,7 +1,10 @@
+import hashlib
 import logging
 import math
 import os
+import re
 import ssl
+import time
 from collections.abc import AsyncIterator
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -62,6 +65,7 @@ OUTPOST_HOSTNAME = f"{TENANT_ID}-{OUTPOST_NAME}-outpost" if TENANT_ID else "prox
 # Default to the in-cluster Kubernetes serviceaccount CA bundle if present;
 # users can override with CA_BUNDLE for non-kube self-signed targets.
 DEFAULT_K8S_CA_BUNDLE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+SERVICE_ACCOUNT_CA_PATH = Path(DEFAULT_K8S_CA_BUNDLE)
 ca_bundle_env = os.environ.get("CA_BUNDLE")
 if ca_bundle_env:
     CA_BUNDLE_PATH: Path | None = Path(ca_bundle_env)
@@ -259,6 +263,123 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/_internal/version")
 async def internal_version() -> dict[str, str]:
     return {"version": OUTPOST_VERSION}
+
+
+IDENTITY_CACHE_SECONDS = 300.0
+IDENTITY_TIMEOUT = httpx.Timeout(5.0)
+_PEM_CERT_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.DOTALL
+)
+_identity_cache: tuple[float, dict[str, object]] | None = None
+
+
+def ca_bundle_sha256_fingerprints(pem_bundle: str) -> list[str]:
+    """SHA-256 of each DER cert in a PEM bundle, as lowercase hex.
+
+    Matches how Cartography fingerprints AWSEKSCluster.certificateAuthority, so
+    SubImage can tie this outpost to the EKS cluster it proxies.
+    """
+    return [
+        hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+        for pem in _PEM_CERT_RE.findall(pem_bundle)
+    ]
+
+
+def kubernetes_platform(git_version: str) -> str:
+    if "-eks-" in git_version:
+        return "eks"
+    if "-gke." in git_version:
+        return "gke"
+    return "unknown"
+
+
+def _caused_by_ssl_error(exc: BaseException) -> bool:
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, ssl.SSLError):
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
+
+
+def identity_client(ca_path: Path) -> httpx.AsyncClient:
+    # Pinned to the serviceaccount CA regardless of VERIFY_TLS: a fingerprint is
+    # only worth reporting if PROXY_TARGET proves it holds that CA's cert.
+    return httpx.AsyncClient(
+        verify=ssl.create_default_context(cafile=str(ca_path)),
+        timeout=IDENTITY_TIMEOUT,
+    )
+
+
+async def _kubernetes_identity() -> tuple[dict[str, object] | None, str | None]:
+    """Fingerprint the cluster behind PROXY_TARGET, or say why we cannot.
+
+    The serviceaccount CA alone only identifies the cluster this pod runs in.
+    PROXY_TARGET can point anywhere, so the fingerprint is only claimed after a
+    TLS handshake to the target verifies against that CA.
+    """
+    try:
+        pem_bundle = SERVICE_ACCOUNT_CA_PATH.read_text()
+    except OSError:
+        return None, "no_service_account_ca"
+
+    fingerprints = ca_bundle_sha256_fingerprints(pem_bundle)
+    if not fingerprints:
+        return None, "no_service_account_ca"
+
+    if not TARGET or urlsplit(TARGET).scheme != "https":
+        return None, "target_not_https"
+
+    headers = {}
+    bearer_token = get_bearer_token()
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    try:
+        async with identity_client(SERVICE_ACCOUNT_CA_PATH) as client:
+            response = await client.get(
+                f"{TARGET.rstrip('/')}/version", headers=headers
+            )
+    except (httpx.TransportError, httpx.InvalidURL) as exc:
+        if _caused_by_ssl_error(exc):
+            return None, "target_tls_unverified"
+        return None, "target_unreachable"
+
+    try:
+        git_version = response.json().get("gitVersion")
+    except (ValueError, AttributeError):
+        git_version = None
+    if response.status_code != 200 or not isinstance(git_version, str):
+        return None, "target_not_kubernetes"
+
+    return {
+        "ca_sha256": fingerprints,
+        "target_tls_verified": True,
+        "git_version": git_version,
+        "platform": kubernetes_platform(git_version),
+    }, None
+
+
+@app.get("/_internal/identity")
+async def internal_identity() -> dict[str, object]:
+    global _identity_cache
+
+    now = time.monotonic()
+    if _identity_cache and now - _identity_cache[0] < IDENTITY_CACHE_SECONDS:
+        return _identity_cache[1]
+
+    kubernetes, reason = await _kubernetes_identity()
+    body: dict[str, object] = {
+        "outpost_version": OUTPOST_VERSION,
+        "hostname": OUTPOST_HOSTNAME,
+        "target": SAFE_TARGET,
+        "kubernetes": kubernetes,
+        "reason": reason,
+    }
+    # Failures are not cached so a fixed target shows up on the next poll.
+    if kubernetes is not None:
+        _identity_cache = (now, body)
+    return body
 
 
 def _ordered_log_files() -> list[Path]:

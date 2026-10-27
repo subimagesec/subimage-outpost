@@ -108,6 +108,10 @@ All outposts for a tenant+environment share the same OAuth secret and Tailscale 
 
 The container exits when its proxy process dies, so run it under a restart policy, as the examples above do: `--restart unless-stopped` with `docker run` (instead of `--rm`), `restart: unless-stopped` in Docker Compose, or a Deployment on Kubernetes. Without one, the outpost stays down until someone restarts it.
 
+### Cluster identity
+
+When the outpost runs in Kubernetes and proxies to a Kubernetes API server, `GET /_internal/identity` reports the SHA-256 fingerprint of the cluster CA. SubImage uses it to match the outpost to the cluster it found in your cloud inventory, so the cluster can be enrolled automatically. The outpost reports a fingerprint only after a TLS handshake to `PROXY_TARGET` verifies against the serviceaccount CA, whatever `VERIFY_TLS` is set to. If the handshake fails, `kubernetes` is `null` and `reason` says why.
+
 ---
 
 ## Releasing a New Version
