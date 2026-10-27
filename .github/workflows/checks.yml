@@ -38,7 +38,8 @@ jobs:
       - run: uv run --frozen pytest -q
 
   version-bumped:
-    if: github.actor != 'dependabot[bot]'
+    # PR author stays Dependabot across human re-runs / merge-main; github.actor does not.
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
