@@ -319,24 +319,32 @@ async def _kubernetes_identity() -> tuple[dict[str, object] | None, str | None]:
     TLS handshake to the target verifies against that CA.
     """
     try:
-        pem_bundle = SERVICE_ACCOUNT_CA_PATH.read_text()
-    except OSError:
+        fingerprints = ca_bundle_sha256_fingerprints(
+            SERVICE_ACCOUNT_CA_PATH.read_text()
+        )
+    except (OSError, ValueError):
         return None, "no_service_account_ca"
-
-    fingerprints = ca_bundle_sha256_fingerprints(pem_bundle)
     if not fingerprints:
         return None, "no_service_account_ca"
 
     if not TARGET or urlsplit(TARGET).scheme != "https":
         return None, "target_not_https"
 
+    try:
+        client = identity_client(SERVICE_ACCOUNT_CA_PATH)
+    except ssl.SSLError:
+        # The PEM decoded but OpenSSL would not load it as a trust anchor.
+        return None, "no_service_account_ca"
+
     headers = {}
+    if TARGET_HOST:
+        headers["Host"] = TARGET_HOST
     bearer_token = get_bearer_token()
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
 
     try:
-        async with identity_client(SERVICE_ACCOUNT_CA_PATH) as client:
+        async with client:
             response = await client.get(
                 f"{TARGET.rstrip('/')}/version", headers=headers
             )

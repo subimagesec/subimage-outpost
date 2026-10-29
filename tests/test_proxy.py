@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -587,17 +588,16 @@ def load_identity_proxy(monkeypatch, tmp_path, ca_pem, handler, env=None):
         calls.append(request)
         return handler(request)
 
-    monkeypatch.setattr(
-        proxy,
-        "identity_client",
-        lambda _ca_path: httpx.AsyncClient(
-            transport=httpx.MockTransport(recording_handler)
-        ),
-    )
+    def pinned_client(pinned_ca_path):
+        assert pinned_ca_path == ca_path
+        return httpx.AsyncClient(transport=httpx.MockTransport(recording_handler))
+
+    monkeypatch.setattr(proxy, "identity_client", pinned_client)
     return proxy, calls
 
 
-def test_identity_reports_verified_kubernetes_target(monkeypatch, tmp_path):
+@pytest.mark.parametrize("verify_tls", ["true", "false"])
+def test_identity_reports_verified_kubernetes_target(monkeypatch, tmp_path, verify_tls):
     proxy, calls = load_identity_proxy(
         monkeypatch,
         tmp_path,
@@ -605,7 +605,13 @@ def test_identity_reports_verified_kubernetes_target(monkeypatch, tmp_path):
         lambda _request: httpx.Response(
             200, json={"gitVersion": "v1.31.2-eks-7f9249a"}
         ),
-        env={"TENANT_ID": "acme", "NAME": "prod", "BEARER_TOKEN": "sa-token"},
+        env={
+            "TENANT_ID": "acme",
+            "NAME": "prod",
+            "BEARER_TOKEN": "sa-token",
+            "PROXY_HOST": "api.internal",
+            "VERIFY_TLS": verify_tls,
+        },
     )
 
     body = TestClient(proxy.app).get("/_internal/identity").json()
@@ -620,46 +626,81 @@ def test_identity_reports_verified_kubernetes_target(monkeypatch, tmp_path):
     }
     assert str(calls[0].url) == "https://kubernetes.default.svc/version"
     assert calls[0].headers["authorization"] == "Bearer sa-token"
+    assert calls[0].headers["host"] == "api.internal"
 
 
-def test_identity_withholds_fingerprint_when_target_tls_fails(monkeypatch, tmp_path):
-    def handler(_request):
-        raise httpx.ConnectError("handshake failed") from ssl.SSLCertVerificationError(
-            "certificate verify failed"
-        )
-
-    proxy, _ = load_identity_proxy(monkeypatch, tmp_path, CA_A_PEM, handler)
-
-    body = TestClient(proxy.app).get("/_internal/identity").json()
-
-    assert body["kubernetes"] is None
-    assert body["reason"] == "target_tls_unverified"
-
-
-def test_identity_withholds_fingerprint_for_non_kubernetes_target(
-    monkeypatch, tmp_path
-):
-    proxy, _ = load_identity_proxy(
-        monkeypatch,
-        tmp_path,
-        CA_A_PEM,
-        lambda _request: httpx.Response(200, text="<html>Snipe-IT</html>"),
+def _tls_failure(_request):
+    raise httpx.ConnectError("handshake failed") from ssl.SSLCertVerificationError(
+        "certificate verify failed"
     )
 
+
+def _unreachable(_request):
+    raise httpx.ConnectError("connection refused")
+
+
+@pytest.mark.parametrize(
+    ("handler", "env", "reason"),
+    [
+        (_tls_failure, None, "target_tls_unverified"),
+        (_unreachable, None, "target_unreachable"),
+        (
+            lambda _request: httpx.Response(200, text="<html>Snipe-IT</html>"),
+            None,
+            "target_not_kubernetes",
+        ),
+        (
+            _unreachable,
+            {"PROXY_TARGET": "http://snipe-it.internal"},
+            "target_not_https",
+        ),
+    ],
+)
+def test_identity_withholds_fingerprint_for_unproven_target(
+    monkeypatch, tmp_path, handler, env, reason
+):
+    proxy, _ = load_identity_proxy(monkeypatch, tmp_path, CA_A_PEM, handler, env=env)
+
     body = TestClient(proxy.app).get("/_internal/identity").json()
 
     assert body["kubernetes"] is None
-    assert body["reason"] == "target_not_kubernetes"
+    assert body["reason"] == reason
 
 
-def test_identity_without_service_account_ca(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "ca_pem",
+    [
+        None,
+        "",
+        "-----BEGIN CERTIFICATE-----\n!!not base64!!\n-----END CERTIFICATE-----\n",
+        "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+    ],
+    ids=["missing", "empty", "undecodable", "not-a-certificate"],
+)
+def test_identity_without_usable_service_account_ca(monkeypatch, tmp_path, ca_pem):
     proxy = load_proxy(monkeypatch)
-    monkeypatch.setattr(proxy, "SERVICE_ACCOUNT_CA_PATH", tmp_path / "missing.crt")
+    ca_path = tmp_path / "ca.crt"
+    if ca_pem is not None:
+        ca_path.write_text(ca_pem)
+    monkeypatch.setattr(proxy, "SERVICE_ACCOUNT_CA_PATH", ca_path)
 
-    body = TestClient(proxy.app).get("/_internal/identity").json()
+    response = TestClient(proxy.app).get("/_internal/identity")
 
-    assert body["kubernetes"] is None
-    assert body["reason"] == "no_service_account_ca"
+    assert response.status_code == 200
+    assert response.json()["kubernetes"] is None
+    assert response.json()["reason"] == "no_service_account_ca"
+
+
+@pytest.mark.parametrize(
+    ("git_version", "platform"),
+    [
+        ("v1.31.2-eks-7f9249a", "eks"),
+        ("v1.30.5-gke.1014001", "gke"),
+        ("v1.31.1+k3s1", "unknown"),
+    ],
+)
+def test_kubernetes_platform(monkeypatch, git_version, platform):
+    assert load_proxy(monkeypatch).kubernetes_platform(git_version) == platform
 
 
 def test_identity_caches_only_successful_lookups(monkeypatch, tmp_path):
