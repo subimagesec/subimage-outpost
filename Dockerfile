@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 # Pin updated by Dependabot (docker ecosystem, /).
-FROM tailscale/tailscale:v1.104.1@sha256:87c55d6be56ad85b3d8bceca5f87f73de288c609131460dd1be1874c250cc41d AS tailscale
+FROM tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d AS tailscale
 
 # Base image
-FROM python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS base
+FROM python:3.15.0-slim@sha256:f5b92f2a669a4c347044f29367f31983280b648250ca94dea66f98c53bc87e58 AS base
 # UID/GID for non-root user (https://github.com/hexops/dockerfile#do-not-use-a-uid-below-10000)
 ARG uid=10001
 ARG gid=10001
