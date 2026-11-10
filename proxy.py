@@ -46,6 +46,12 @@ HOP_BY_HOP_HEADERS = frozenset(
     ]
 )
 
+# httpx decompresses the upstream body, so these describe bytes the client never
+# receives. Forwarded as-is, a gzipped API (GitLab behind nginx, for one) reaches
+# the client labelled gzip but already inflated, and every response fails to
+# decode. Starlette sets the length of the body it actually sends.
+DECODED_BODY_HEADERS = frozenset(["content-encoding", "content-length"])
+
 TARGET = os.environ.get("PROXY_TARGET")  # e.g. "https://snipeit.internal.local"
 TARGET_HOST = os.environ.get("PROXY_HOST")  # optional: override Host header
 VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
@@ -381,11 +387,10 @@ async def proxy(request: Request, path: str):
             },
         )
 
-    # Filter hop-by-hop headers from response
     response_headers = {
         k: v
         for k, v in proxied_response.headers.items()
-        if k.lower() not in HOP_BY_HOP_HEADERS
+        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() not in DECODED_BODY_HEADERS
     }
 
     return Response(

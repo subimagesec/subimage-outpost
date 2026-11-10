@@ -1,3 +1,4 @@
+import gzip
 import logging
 import os
 import subprocess
@@ -545,3 +546,27 @@ def test_internal_routes_not_proxied(monkeypatch):
 
     assert response.status_code == 200
     assert "version" in response.json()
+
+
+def test_compressed_upstream_response_reaches_client_decodable(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+    body = b'{"id": 2, "name": "platform"}'
+
+    async def gzipped_request(*args, **kwargs):
+        response = httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            stream=httpx.ByteStream(gzip.compress(body)),
+        )
+        await response.aread()
+        return response
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(proxy.app.state.client, "request", gzipped_request)
+        response = client.get("/api/v4/groups/2")
+
+    assert response.status_code == 200
+    assert response.content == body
