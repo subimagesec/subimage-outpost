@@ -558,6 +558,7 @@ def test_compressed_upstream_response_reaches_client_decodable(monkeypatch):
             headers={
                 "content-type": "application/json",
                 "content-encoding": "gzip",
+                "content-length": str(len(gzip.compress(body))),
             },
             stream=httpx.ByteStream(gzip.compress(body)),
         )
@@ -570,3 +571,21 @@ def test_compressed_upstream_response_reaches_client_decodable(monkeypatch):
 
     assert response.status_code == 200
     assert response.content == body
+    assert response.headers["content-length"] == str(len(body))
+
+
+def test_target_is_asked_only_for_encodings_the_proxy_decodes(monkeypatch):
+    proxy = load_proxy(monkeypatch)
+    sent_headers = []
+
+    async def recording_request(*args, **kwargs):
+        sent_headers.append(kwargs["headers"])
+        return httpx.Response(200, json={"ok": True})
+
+    with TestClient(proxy.app) as client:
+        monkeypatch.setattr(proxy.app.state.client, "request", recording_request)
+        client.get(
+            "/api/v4/groups/2", headers={"Accept-Encoding": "gzip, deflate, br, zstd"}
+        )
+
+    assert sent_headers[0]["Accept-Encoding"] == "gzip, deflate"

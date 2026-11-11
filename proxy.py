@@ -52,6 +52,11 @@ HOP_BY_HOP_HEADERS = frozenset(
 # decode. Starlette sets the length of the body it actually sends.
 DECODED_BODY_HEADERS = frozenset(["content-encoding", "content-length"])
 
+# Because the decoded body goes out with no Content-Encoding, the target may use
+# only encodings httpx decodes here. brotli and zstandard are not installed, and
+# SubImage's httpx clients advertise zstd, so the client's own list is replaced.
+UPSTREAM_ACCEPT_ENCODING = "gzip, deflate"
+
 TARGET = os.environ.get("PROXY_TARGET")  # e.g. "https://snipeit.internal.local"
 TARGET_HOST = os.environ.get("PROXY_HOST")  # optional: override Host header
 VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
@@ -226,8 +231,10 @@ def build_proxy_headers(request_headers: Mapping[str, str]) -> dict[str, str]:
     headers = {
         k: v
         for k, v in request_headers.items()
-        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "host"
+        if k.lower() not in HOP_BY_HOP_HEADERS
+        and k.lower() not in ("host", "accept-encoding")
     }
+    headers["Accept-Encoding"] = UPSTREAM_ACCEPT_ENCODING
 
     if TARGET_HOST:
         headers["Host"] = TARGET_HOST
