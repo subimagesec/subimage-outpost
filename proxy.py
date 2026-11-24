@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import ssl
+from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -17,6 +18,11 @@ from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
 from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
+from starlette.types import Receive
+from starlette.types import Scope
+from starlette.types import Send
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,11 @@ DECODED_BODY_HEADERS = frozenset(["content-encoding", "content-length"])
 # only encodings httpx decodes here. brotli and zstandard are not installed, and
 # SubImage's httpx clients advertise zstd, so the client's own list is replaced.
 UPSTREAM_ACCEPT_ENCODING = "gzip, deflate"
+
+# Git smart-HTTP services. Their requests and responses are streamed through
+# untouched instead of buffered and decoded: a pack can be gigabytes, and git
+# gzips its own request bodies and decodes its own responses.
+GIT_SERVICES = frozenset(["git-upload-pack", "git-receive-pack"])
 
 TARGET = os.environ.get("PROXY_TARGET")  # e.g. "https://snipeit.internal.local"
 TARGET_HOST = os.environ.get("PROXY_HOST")  # optional: override Host header
@@ -227,14 +238,37 @@ def get_bearer_token() -> str | None:
     return token
 
 
-def build_proxy_headers(request_headers: Mapping[str, str]) -> dict[str, str]:
+def connection_nominated(headers: Mapping[str, str]) -> set[str]:
+    """Headers the sender marked hop-by-hop by listing them in `Connection`."""
+    return {
+        token.strip().lower()
+        for k, v in headers.items()
+        if k.lower() == "connection"
+        for token in v.split(",")
+        if token.strip()
+    }
+
+
+def build_proxy_headers(
+    request_headers: Mapping[str, str], passthrough_encoding: bool = False
+) -> dict[str, str]:
+    if passthrough_encoding:
+        # Only the git path honors Connection-nominated headers, so every other
+        # request keeps forwarding exactly what it did before.
+        dropped = {"host"} | connection_nominated(request_headers)
+    else:
+        dropped = {"host", "accept-encoding"}
     headers = {
         k: v
         for k, v in request_headers.items()
-        if k.lower() not in HOP_BY_HOP_HEADERS
-        and k.lower() not in ("host", "accept-encoding")
+        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() not in dropped
     }
-    headers["Accept-Encoding"] = UPSTREAM_ACCEPT_ENCODING
+    if not passthrough_encoding:
+        headers["Accept-Encoding"] = UPSTREAM_ACCEPT_ENCODING
+    elif not any(k.lower() == "accept-encoding" for k in headers):
+        # httpx would otherwise add its own default, and the target's compressed
+        # answer would reach a client that never asked for one.
+        headers["Accept-Encoding"] = "identity"
 
     if TARGET_HOST:
         headers["Host"] = TARGET_HOST
@@ -247,6 +281,20 @@ def build_proxy_headers(request_headers: Mapping[str, str]) -> dict[str, str]:
         headers["Authorization"] = f"Bearer {bearer_token}"
 
     return headers
+
+
+def is_git_smart_http(method: str, path: str, service: str | None) -> bool:
+    """Match git smart-HTTP by its URL shape, which every git client produces.
+
+    The repository path need not end in `.git`: git keeps whatever URL the user
+    cloned, and GitHub Enterprise Server serves both forms.
+    """
+    segments = path.split("/")
+    if method == "GET":
+        return segments[-2:] == ["info", "refs"] and service in GIT_SERVICES
+    if method == "POST":
+        return segments[-1] in GIT_SERVICES
+    return False
 
 
 @asynccontextmanager
@@ -330,12 +378,146 @@ async def internal_logs(
     }
 
 
+def describe_failure(exc: Exception) -> str:
+    # httpx raises some of these with an empty message, so only append one
+    # when there is something to say.
+    detail = type(exc).__name__
+    if str(exc):
+        detail = f"{detail}: {exc}"
+    return detail
+
+
+def upstream_failure_response(exc: httpx.TransportError | httpx.InvalidURL) -> Response:
+    # Never getting an answer from upstream (timed out, refused, or the name
+    # would not resolve) is a gateway timeout; any other transport-level
+    # failure is a bad gateway.
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        status_code = 504
+        message = (
+            "Outpost could not reach its proxy target "
+            f"(connect timeout {CONNECT_TIMEOUT}s, read timeout {READ_TIMEOUT}s)"
+        )
+    elif isinstance(exc, httpx.InvalidURL):
+        # Points at the configuration rather than the network, which is a
+        # different fix for whoever reads this.
+        status_code = 502
+        message = "Outpost could not build a valid URL for its proxy target"
+    else:
+        status_code = 502
+        message = "Outpost failed to proxy the request to its target"
+
+    detail = describe_failure(exc)
+
+    # A warning, not a traceback: this is tee'd to OUTPOST_LOG_FILE and read
+    # back through /_internal/logs and the outposts settings page.
+    logger.warning("%s: %s: %s", message, SAFE_TARGET, detail)
+
+    # Deliberately not a Kubernetes `Status` object: the backend tells an
+    # outpost-side failure apart from a genuine API server 5xx by checking
+    # that the body is not one (see _is_outpost_upstream_failure in
+    # subimage-backend/app/sync/modules/kubernetes.py).
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": message,
+            "outpost": OUTPOST_HOSTNAME,
+            "target": SAFE_TARGET,
+            "detail": detail,
+            "version": OUTPOST_VERSION,
+        },
+    )
+
+
+class UpstreamAborted(Exception):
+    """The target failed after the response status line went to the client."""
+
+
+class UpstreamStreamingResponse(StreamingResponse):
+    """Relay an httpx streaming response byte for byte, and always close it."""
+
+    def __init__(self, upstream: httpx.Response) -> None:
+        self.upstream = upstream
+        self.chunks = self._relay()
+        dropped = HOP_BY_HOP_HEADERS | connection_nominated(upstream.headers)
+        super().__init__(
+            self.chunks,
+            status_code=upstream.status_code,
+            headers={
+                k: v for k, v in upstream.headers.items() if k.lower() not in dropped
+            },
+        )
+
+    async def _relay(self) -> AsyncGenerator[bytes]:
+        # aiter_raw, not aiter_bytes: the body keeps its Content-Encoding, so the
+        # target's Content-Length and Content-Encoding stay true for the client.
+        try:
+            async for chunk in self.upstream.aiter_raw():
+                yield chunk
+        except httpx.TransportError as exc:
+            logger.warning(
+                "Outpost lost its proxy target mid-response; aborting the client "
+                "connection: %s: %s",
+                SAFE_TARGET,
+                describe_failure(exc),
+            )
+            raise UpstreamAborted from exc
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except UpstreamAborted:
+            # The status line is already out, so the JSON envelope cannot be
+            # sent. Returning without the final body message makes the server
+            # drop the connection without a clean end of body, which every HTTP
+            # client, git included, reports as a failed transfer rather than
+            # mistaking a truncated pack for a whole one.
+            pass
+        finally:
+            # Covers a finished body, a client that disconnected mid-stream and
+            # a target that failed mid-stream alike.
+            await self.chunks.aclose()
+            await self.upstream.aclose()
+
+
+async def stream_git(request: Request, url: str) -> Response:
+    client: httpx.AsyncClient = request.app.state.client
+    has_body = (
+        "content-length" in request.headers or "transfer-encoding" in request.headers
+    )
+
+    try:
+        upstream_request = client.build_request(
+            method=request.method,
+            url=url,
+            headers=build_proxy_headers(request.headers, passthrough_encoding=True),
+            # A bodyless GET must not turn into a chunked one, which some
+            # servers reject.
+            content=request.stream() if has_body else None,
+            params=request.query_params,
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except (httpx.TransportError, httpx.InvalidURL) as exc:
+        return upstream_failure_response(exc)
+    except ClientDisconnect:
+        # The client hung up mid-upload. httpx has already dropped the target
+        # connection, and nobody is left to read a response, so this is not an
+        # outpost failure worth a traceback.
+        logger.info("Client disconnected while uploading to %s", SAFE_TARGET)
+        return Response(status_code=400)
+
+    return UpstreamStreamingResponse(upstream)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
     if not TARGET:
         raise RuntimeError("PROXY_TARGET must be set, e.g. https://myservice.local")
 
     url = f"{TARGET.rstrip('/')}/{path}"
+
+    if is_git_smart_http(request.method, path, request.query_params.get("service")):
+        return await stream_git(request, url)
+
     headers = build_proxy_headers(request.headers)
     client: httpx.AsyncClient = request.app.state.client
 
@@ -351,48 +533,7 @@ async def proxy(request: Request, path: str):
     # PROXY_TARGET with something like a bad port would otherwise escape as the
     # opaque 500 this handler exists to eliminate.
     except (httpx.TransportError, httpx.InvalidURL) as exc:
-        # Never getting an answer from upstream (timed out, refused, or the name
-        # would not resolve) is a gateway timeout; any other transport-level
-        # failure is a bad gateway.
-        if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
-            status_code = 504
-            message = (
-                "Outpost could not reach its proxy target "
-                f"(connect timeout {CONNECT_TIMEOUT}s, read timeout {READ_TIMEOUT}s)"
-            )
-        elif isinstance(exc, httpx.InvalidURL):
-            # Points at the configuration rather than the network, which is a
-            # different fix for whoever reads this.
-            status_code = 502
-            message = "Outpost could not build a valid URL for its proxy target"
-        else:
-            status_code = 502
-            message = "Outpost failed to proxy the request to its target"
-
-        # httpx raises some of these with an empty message, so only append one
-        # when there is something to say.
-        detail = type(exc).__name__
-        if str(exc):
-            detail = f"{detail}: {exc}"
-
-        # A warning, not a traceback: this is tee'd to OUTPOST_LOG_FILE and read
-        # back through /_internal/logs and the outposts settings page.
-        logger.warning("%s: %s: %s", message, SAFE_TARGET, detail)
-
-        # Deliberately not a Kubernetes `Status` object: the backend tells an
-        # outpost-side failure apart from a genuine API server 5xx by checking
-        # that the body is not one (see _is_outpost_upstream_failure in
-        # subimage-backend/app/sync/modules/kubernetes.py).
-        return JSONResponse(
-            status_code=status_code,
-            content={
-                "error": message,
-                "outpost": OUTPOST_HOSTNAME,
-                "target": SAFE_TARGET,
-                "detail": detail,
-                "version": OUTPOST_VERSION,
-            },
-        )
+        return upstream_failure_response(exc)
 
     response_headers = {
         k: v

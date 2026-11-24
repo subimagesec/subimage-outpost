@@ -27,7 +27,7 @@ This container runs:
 | `BEARER_TOKEN`        | Bearer token for authentication (added to Authorization header) | _None_  |
 | `BEARER_TOKEN_PATH`   | Path to file containing bearer token                        | _None_      |
 | `PROXY_CONNECT_TIMEOUT` | Seconds to wait for a TCP/TLS connection to `PROXY_TARGET`. Raise it when cluster DNS is slow (a degraded CoreDNS with `ndots:5` search-domain fanout can take a while to resolve `kubernetes.default.svc`). | `15` |
-| `PROXY_READ_TIMEOUT`  | Seconds to wait for the target's response; also applied to the write and pool timeouts. Raise it for large `list` calls against a big cluster. | `60` |
+| `PROXY_READ_TIMEOUT`  | Seconds to wait for the target's response, or for the next chunk of a streamed Git response; also applied to the write and pool timeouts. Raise it for large `list` calls against a big cluster. | `60` |
 
 The `TENANT_ID`, `ENVIRONMENT`, and `NAME` automatically configure:
 - Tailscale hostname: `{TENANT_ID}-{NAME}-outpost`
@@ -46,6 +46,20 @@ If either variable is set, the proxy automatically adds an `Authorization: Beare
 - **Kubernetes API**: When deployed via Helm with RBAC enabled, `BEARER_TOKEN_PATH` is automatically set to `/var/run/secrets/kubernetes.io/serviceaccount/token`
 - **Internal services**: Pass a static token via `BEARER_TOKEN` or mount a token file and use `BEARER_TOKEN_PATH`
 - **No auth**: If neither variable is set, requests are forwarded without authentication
+
+### Git over the outpost
+
+From version 1.2.5, you can run `git clone`, `git fetch` and `git push` through the outpost against a Git smart-HTTP server, such as GitHub Enterprise Server.
+
+The outpost recognizes Git traffic by its URL: `GET .../info/refs?service=git-upload-pack` or `?service=git-receive-pack`, and `POST .../git-upload-pack` or `.../git-receive-pack`. For these requests, the outpost streams the request and the response in both directions and passes them through byte for byte. It keeps `Accept-Encoding`, `Content-Encoding` and `Content-Length` as the client and the target sent them, so a pack of any size never sits in memory. If the client sends no `Accept-Encoding`, the outpost sends `Accept-Encoding: identity`, so the target answers uncompressed.
+
+`PROXY_READ_TIMEOUT` limits how long the outpost waits for the next chunk of data, not the whole transfer. A long clone keeps running while data flows.
+
+If the target fails before it answers, you get the usual JSON error with status 502 or 504. If the target fails after the response starts, the outpost closes the connection before the body ends, and Git reports the transfer as failed.
+
+All other requests work as before: the outpost buffers them and decodes compressed responses.
+
+To check that an outpost supports Git, call `GET /_internal/version` and confirm that `version` is `1.2.5` or later.
 
 ---
 

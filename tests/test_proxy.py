@@ -1,12 +1,28 @@
+import base64
 import gzip
 import logging
 import os
+import shutil
+import socket
 import subprocess
 import sys
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from email.message import Message
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+import pytest
+import uvicorn
 from fastapi.testclient import TestClient
+
+# Built at run time so the test file holds no literal credential header, which
+# secret scanners flag even when the value is a placeholder.
+CALLER_BASIC_AUTH = "Basic " + base64.b64encode(b"caller:placeholder").decode()
 
 
 def load_proxy(
@@ -26,6 +42,10 @@ def load_proxy(
     monkeypatch.delenv("TENANT_ID", raising=False)
     monkeypatch.delenv("PROXY_CONNECT_TIMEOUT", raising=False)
     monkeypatch.delenv("PROXY_READ_TIMEOUT", raising=False)
+    # The proxy's httpx client honors these, and every upstream here is loopback.
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
 
     if token is not None:
         monkeypatch.setenv("BEARER_TOKEN", token)
@@ -589,3 +609,447 @@ def test_target_is_asked_only_for_encodings_the_proxy_decodes(monkeypatch):
         )
 
     assert sent_headers[0]["Accept-Encoding"] == "gzip, deflate"
+
+
+# Git smart-HTTP streaming. These run the proxy under a real uvicorn server
+# against a real upstream, because the TestClient transport buffers the whole
+# response and so cannot show whether the proxy streams.
+
+
+@contextmanager
+def serve_upstream(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@contextmanager
+def serve_proxy(proxy) -> Iterator[str]:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    # No log config, so uvicorn's records propagate to caplog.
+    server = uvicorn.Server(
+        uvicorn.Config(proxy.app, log_level="warning", log_config=None)
+    )
+    thread = threading.Thread(
+        target=server.run, kwargs={"sockets": [sock]}, daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started:
+        assert time.monotonic() < deadline, "proxy did not start"
+        time.sleep(0.01)
+    try:
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        server.should_exit = True
+        thread.join(10)
+        sock.close()
+
+
+def unused_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def read_request_body(handler: BaseHTTPRequestHandler) -> bytes:
+    if "chunked" in handler.headers.get("Transfer-Encoding", ""):
+        body = b""
+        while size := int(handler.rfile.readline().split(b";")[0], 16):
+            body += handler.rfile.read(size)
+            handler.rfile.readline()
+        handler.rfile.readline()
+        return body
+    return handler.rfile.read(int(handler.headers.get("Content-Length", 0)))
+
+
+def write_chunk(handler: BaseHTTPRequestHandler, data: bytes) -> None:
+    handler.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+    handler.wfile.flush()
+
+
+def git_http_backend_handler(project_root: Path) -> type[BaseHTTPRequestHandler]:
+    """Serve repositories under project_root with git's own smart-HTTP CGI."""
+
+    class GitHttpBackend(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.run_backend()
+
+        def do_POST(self):
+            self.run_backend()
+
+        def run_backend(self):
+            path, _, query = self.path.partition("?")
+            env = {
+                "PATH": os.environ["PATH"],
+                "GIT_PROJECT_ROOT": str(project_root),
+                "GIT_HTTP_EXPORT_ALL": "1",
+                "REQUEST_METHOD": self.command,
+                "PATH_INFO": path,
+                "QUERY_STRING": query,
+                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                "REMOTE_ADDR": "127.0.0.1",
+            }
+            for name, value in self.headers.items():
+                env["HTTP_" + name.upper().replace("-", "_")] = value
+            output = subprocess.run(
+                ["git", "http-backend"],
+                input=read_request_body(self),
+                env=env,
+                capture_output=True,
+                check=True,
+            ).stdout
+            head, _, body = output.partition(b"\r\n\r\n")
+            status = 200
+            headers = []
+            for line in head.decode().split("\r\n"):
+                name, _, value = line.partition(": ")
+                if name.lower() == "status":
+                    status = int(value.split()[0])
+                else:
+                    headers.append((name, value))
+            self.send_response(status)
+            for name, value in headers:
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    return GitHttpBackend
+
+
+def run_git(*args: str, cwd: Path, home: Path) -> str:
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(home / ".gitconfig"),
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_PROXY": "*",
+    }
+    return subprocess.run(
+        ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=True
+    ).stdout
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_git_clone_and_push_through_the_proxy(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(
+        "[user]\n\tname = Outpost Test\n\temail = outpost@example.com\n"
+        "[init]\n\tdefaultBranch = main\n"
+    )
+    project_root = tmp_path / "srv"
+    bare = project_root / "team" / "app.git"
+    bare.mkdir(parents=True)
+    run_git("init", "--bare", cwd=bare, home=home)
+    run_git("config", "http.receivepack", "true", cwd=bare, home=home)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    run_git("init", cwd=seed, home=home)
+    # Incompressible content, so the pack spans many chunks on the way through.
+    (seed / "blob.bin").write_bytes(os.urandom(2 * 1024 * 1024))
+    run_git("add", ".", cwd=seed, home=home)
+    run_git("commit", "-m", "seed", cwd=seed, home=home)
+    run_git("push", str(bare), "main", cwd=seed, home=home)
+
+    with serve_upstream(git_http_backend_handler(project_root)) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost:
+            run_git(
+                "clone", f"{outpost}/team/app.git", "clone", cwd=tmp_path, home=home
+            )
+            clone = tmp_path / "clone"
+            assert (clone / "blob.bin").read_bytes() == (seed / "blob.bin").read_bytes()
+
+            (clone / "change.txt").write_text("pushed through the outpost\n")
+            run_git("add", ".", cwd=clone, home=home)
+            run_git("commit", "-m", "through the outpost", cwd=clone, home=home)
+            run_git("push", "origin", "main", cwd=clone, home=home)
+
+    assert (
+        run_git("log", "-1", "--format=%s", "main", cwd=bare, home=home).strip()
+        == "through the outpost"
+    )
+
+
+def test_git_response_streams_before_the_target_finishes(monkeypatch):
+    released = threading.Event()
+    upstream_finished = threading.Event()
+
+    class SlowPack(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            read_request_body(self)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-git-upload-pack-result")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            write_chunk(self, b"first")
+            released.wait(5)
+            # Each gap is under PROXY_READ_TIMEOUT, the whole body is not: the
+            # timeout bounds the wait for the next chunk, not the transfer.
+            for _ in range(5):
+                time.sleep(0.3)
+                write_chunk(self, b"more")
+            write_chunk(self, b"")
+            upstream_finished.set()
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(SlowPack) as upstream:
+        proxy = load_proxy(
+            monkeypatch, env={"PROXY_TARGET": upstream, "PROXY_READ_TIMEOUT": "1"}
+        )
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            with client.stream(
+                "POST", f"{outpost}/team/app.git/git-upload-pack", content=b"0000"
+            ) as response:
+                chunks = response.iter_raw()
+                first = next(chunks)
+                target_was_still_sending = not upstream_finished.is_set()
+                released.set()
+                rest = b"".join(chunks)
+
+    assert first == b"first"
+    assert target_was_still_sending
+    assert rest == b"more" * 5
+
+
+GZIPPED_BODY = b'{"id": 2, "name": "platform"}'
+
+
+def gzip_upstream(
+    received: list[tuple[str, Message, bytes]],
+) -> type[BaseHTTPRequestHandler]:
+    class GzipEverything(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.answer()
+
+        def do_POST(self):
+            self.answer()
+
+        def answer(self):
+            received.append((self.path, self.headers, read_request_body(self)))
+            compressed = gzip.compress(GZIPPED_BODY)
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(compressed)))
+            self.end_headers()
+            self.wfile.write(compressed)
+
+        def log_message(self, *args):
+            pass
+
+    return GzipEverything
+
+
+def test_git_response_keeps_its_encoding_while_api_responses_are_decoded(
+    monkeypatch,
+):
+    with serve_upstream(gzip_upstream([])) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            with client.stream(
+                "GET",
+                f"{outpost}/team/app.git/info/refs?service=git-upload-pack",
+                headers={"Accept-Encoding": "gzip"},
+            ) as git_response:
+                git_raw = b"".join(git_response.iter_raw())
+            api_response = client.get(
+                f"{outpost}/api/v3/meta", headers={"Accept-Encoding": "gzip, br"}
+            )
+
+    assert git_response.headers["content-encoding"] == "gzip"
+    assert gzip.decompress(git_raw) == GZIPPED_BODY
+    assert "content-encoding" not in api_response.headers
+    assert api_response.content == GZIPPED_BODY
+
+
+def test_git_request_reaches_the_target_as_the_client_sent_it(monkeypatch):
+    received: list[tuple[str, Message, bytes]] = []
+    request_body = gzip.compress(b"0032want " + b"a" * 40 + b"\n00000009done\n")
+
+    with serve_upstream(gzip_upstream(received)) as upstream:
+        proxy = load_proxy(
+            monkeypatch, env={"PROXY_TARGET": upstream}, token="outpost-token"
+        )
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            post_response = client.post(
+                f"{outpost}/team/app.git/git-upload-pack",
+                content=request_body,
+                headers={
+                    "Content-Encoding": "gzip",
+                    "Accept-Encoding": "deflate, gzip, br, zstd",
+                    "Authorization": CALLER_BASIC_AUTH,
+                },
+            )
+            get_response = client.get(
+                f"{outpost}/team/app.git/info/refs?service=git-receive-pack",
+                headers={"Accept-Encoding": "gzip"},
+            )
+
+    assert post_response.status_code == 200
+    assert get_response.status_code == 200
+    (post_path, post_headers, post_body), (get_path, get_headers, _) = received
+    assert post_path == "/team/app.git/git-upload-pack"
+    assert post_body == request_body
+    assert post_headers["Content-Encoding"] == "gzip"
+    assert post_headers["Accept-Encoding"] == "deflate, gzip, br, zstd"
+    assert post_headers.get_all("Authorization") == [CALLER_BASIC_AUTH]
+    assert get_path == "/team/app.git/info/refs?service=git-receive-pack"
+    assert get_headers["Authorization"] == "Bearer outpost-token"
+    # A bodyless GET goes out without a body framing header.
+    assert "Transfer-Encoding" not in get_headers
+
+
+def test_git_drops_headers_named_in_connection(monkeypatch):
+    received: list[Message] = []
+
+    class NamesAHopHeader(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(self.headers)
+            read_request_body(self)
+            self.send_response(200)
+            self.send_header("Connection", "X-Target-Hop")
+            self.send_header("X-Target-Hop", "target-only")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(NamesAHopHeader) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            response = client.post(
+                f"{outpost}/team/app.git/git-upload-pack",
+                content=b"0000",
+                headers={"Connection": "keep-alive, X-Client-Hop", "X-Client-Hop": "1"},
+            )
+
+    assert response.status_code == 200
+    assert "X-Client-Hop" not in received[0]
+    assert "x-target-hop" not in response.headers
+
+
+def test_client_hanging_up_mid_upload_is_not_an_outpost_error(monkeypatch, caplog):
+    target_saw_eof = threading.Event()
+
+    class AwaitsUpload(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                read_request_body(self)
+            except ValueError:
+                pass
+            target_saw_eof.set()
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(AwaitsUpload) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, caplog.at_level(logging.INFO):
+            host, port = outpost.removeprefix("http://").split(":")
+            with socket.create_connection((host, int(port))) as client:
+                client.sendall(
+                    b"POST /team/app.git/git-receive-pack HTTP/1.1\r\n"
+                    b"Host: outpost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    b"4\r\n0000\r\n"
+                )
+                time.sleep(0.3)
+            assert target_saw_eof.wait(5)
+            time.sleep(0.3)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("disconnected while uploading" in r.getMessage() for r in caplog.records)
+
+
+def test_git_target_unreachable_returns_the_json_envelope(monkeypatch):
+    proxy = load_proxy(
+        monkeypatch, env={"PROXY_TARGET": f"http://127.0.0.1:{unused_port()}"}
+    )
+
+    with TestClient(proxy.app) as client:
+        response = client.get("/team/app.git/info/refs?service=git-upload-pack")
+
+    assert response.status_code == 504
+    body = response.json()
+    assert set(body) == {"error", "outpost", "target", "detail", "version"}
+    assert "ConnectError" in body["detail"]
+
+
+def test_git_target_failing_mid_stream_aborts_the_client_connection(monkeypatch):
+    class DiesMidPack(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            read_request_body(self)
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            write_chunk(self, b"partial pack")
+            self.close_connection = True
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(DiesMidPack) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            with client.stream(
+                "POST", f"{outpost}/team/app.git/git-upload-pack", content=b"0000"
+            ) as response:
+                assert response.status_code == 200
+                # Never a clean end of body that would pass a truncated pack off
+                # as a whole one.
+                with pytest.raises(httpx.RemoteProtocolError):
+                    response.read()
+
+
+def test_client_disconnect_mid_stream_closes_the_target_connection(monkeypatch):
+    target_saw_close = threading.Event()
+
+    class EndlessPack(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            read_request_body(self)
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for _ in range(200):
+                    write_chunk(self, b"x" * 1024)
+                    time.sleep(0.05)
+            except OSError:
+                target_saw_close.set()
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(EndlessPack) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost:
+            with (
+                httpx.Client(trust_env=False) as client,
+                client.stream(
+                    "POST", f"{outpost}/team/app.git/git-upload-pack", content=b"0000"
+                ) as response,
+            ):
+                next(response.iter_raw())
+
+            assert target_saw_close.wait(5)
