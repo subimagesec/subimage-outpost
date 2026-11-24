@@ -42,6 +42,10 @@ def load_proxy(
     monkeypatch.delenv("TENANT_ID", raising=False)
     monkeypatch.delenv("PROXY_CONNECT_TIMEOUT", raising=False)
     monkeypatch.delenv("PROXY_READ_TIMEOUT", raising=False)
+    # The proxy's httpx client honors these, and every upstream here is loopback.
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
 
     if token is not None:
         monkeypatch.setenv("BEARER_TOKEN", token)
@@ -629,7 +633,10 @@ def serve_upstream(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
 def serve_proxy(proxy) -> Iterator[str]:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(proxy.app, log_level="warning"))
+    # No log config, so uvicorn's records propagate to caplog.
+    server = uvicorn.Server(
+        uvicorn.Config(proxy.app, log_level="warning", log_config=None)
+    )
     thread = threading.Thread(
         target=server.run, kwargs={"sockets": [sock]}, daemon=True
     )
@@ -807,7 +814,7 @@ def test_git_response_streams_before_the_target_finishes(monkeypatch):
         proxy = load_proxy(
             monkeypatch, env={"PROXY_TARGET": upstream, "PROXY_READ_TIMEOUT": "1"}
         )
-        with serve_proxy(proxy) as outpost, httpx.Client() as client:
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
             with client.stream(
                 "POST", f"{outpost}/team/app.git/git-upload-pack", content=b"0000"
             ) as response:
@@ -855,7 +862,7 @@ def test_git_response_keeps_its_encoding_while_api_responses_are_decoded(
 ):
     with serve_upstream(gzip_upstream([])) as upstream:
         proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
-        with serve_proxy(proxy) as outpost, httpx.Client() as client:
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
             with client.stream(
                 "GET",
                 f"{outpost}/team/app.git/info/refs?service=git-upload-pack",
@@ -880,8 +887,8 @@ def test_git_request_reaches_the_target_as_the_client_sent_it(monkeypatch):
         proxy = load_proxy(
             monkeypatch, env={"PROXY_TARGET": upstream}, token="outpost-token"
         )
-        with serve_proxy(proxy) as outpost, httpx.Client() as client:
-            client.post(
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            post_response = client.post(
                 f"{outpost}/team/app.git/git-upload-pack",
                 content=request_body,
                 headers={
@@ -890,11 +897,13 @@ def test_git_request_reaches_the_target_as_the_client_sent_it(monkeypatch):
                     "Authorization": CALLER_BASIC_AUTH,
                 },
             )
-            client.get(
+            get_response = client.get(
                 f"{outpost}/team/app.git/info/refs?service=git-receive-pack",
                 headers={"Accept-Encoding": "gzip"},
             )
 
+    assert post_response.status_code == 200
+    assert get_response.status_code == 200
     (post_path, post_headers, post_body), (get_path, get_headers, _) = received
     assert post_path == "/team/app.git/git-upload-pack"
     assert post_body == request_body
@@ -905,6 +914,68 @@ def test_git_request_reaches_the_target_as_the_client_sent_it(monkeypatch):
     assert get_headers["Authorization"] == "Bearer outpost-token"
     # A bodyless GET goes out without a body framing header.
     assert "Transfer-Encoding" not in get_headers
+
+
+def test_git_drops_headers_named_in_connection(monkeypatch):
+    received: list[Message] = []
+
+    class NamesAHopHeader(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(self.headers)
+            read_request_body(self)
+            self.send_response(200)
+            self.send_header("Connection", "X-Target-Hop")
+            self.send_header("X-Target-Hop", "target-only")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(NamesAHopHeader) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            response = client.post(
+                f"{outpost}/team/app.git/git-upload-pack",
+                content=b"0000",
+                headers={"Connection": "keep-alive, X-Client-Hop", "X-Client-Hop": "1"},
+            )
+
+    assert response.status_code == 200
+    assert "X-Client-Hop" not in received[0]
+    assert "x-target-hop" not in response.headers
+
+
+def test_client_hanging_up_mid_upload_is_not_an_outpost_error(monkeypatch, caplog):
+    target_saw_eof = threading.Event()
+
+    class AwaitsUpload(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                read_request_body(self)
+            except ValueError:
+                pass
+            target_saw_eof.set()
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(AwaitsUpload) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, caplog.at_level(logging.INFO):
+            host, port = outpost.removeprefix("http://").split(":")
+            with socket.create_connection((host, int(port))) as client:
+                client.sendall(
+                    b"POST /team/app.git/git-receive-pack HTTP/1.1\r\n"
+                    b"Host: outpost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    b"4\r\n0000\r\n"
+                )
+                time.sleep(0.3)
+            assert target_saw_eof.wait(5)
+            time.sleep(0.3)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("disconnected while uploading" in r.getMessage() for r in caplog.records)
 
 
 def test_git_target_unreachable_returns_the_json_envelope(monkeypatch):
@@ -938,7 +1009,7 @@ def test_git_target_failing_mid_stream_aborts_the_client_connection(monkeypatch)
 
     with serve_upstream(DiesMidPack) as upstream:
         proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
-        with serve_proxy(proxy) as outpost, httpx.Client() as client:
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
             with client.stream(
                 "POST", f"{outpost}/team/app.git/git-upload-pack", content=b"0000"
             ) as response:
@@ -974,7 +1045,7 @@ def test_client_disconnect_mid_stream_closes_the_target_connection(monkeypatch):
         proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
         with serve_proxy(proxy) as outpost:
             with (
-                httpx.Client() as client,
+                httpx.Client(trust_env=False) as client,
                 client.stream(
                     "POST", f"{outpost}/team/app.git/git-upload-pack", content=b"0000"
                 ) as response,

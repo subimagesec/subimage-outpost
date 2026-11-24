@@ -51,7 +51,7 @@ If either variable is set, the proxy automatically adds an `Authorization: Beare
 
 From version 1.2.5, you can run `git clone`, `git fetch` and `git push` through the outpost against a Git smart-HTTP server, such as GitHub Enterprise Server.
 
-The outpost recognizes Git traffic by its URL: `GET .../info/refs?service=git-upload-pack` or `?service=git-receive-pack`, and `POST .../git-upload-pack` or `.../git-receive-pack`. For these requests, the outpost streams the request and the response in both directions and passes them through byte for byte. It keeps `Accept-Encoding`, `Content-Encoding` and `Content-Length` as the client and the target sent them, so a pack of any size never sits in memory.
+The outpost recognizes Git traffic by its URL: `GET .../info/refs?service=git-upload-pack` or `?service=git-receive-pack`, and `POST .../git-upload-pack` or `.../git-receive-pack`. For these requests, the outpost streams the request and the response in both directions and passes them through byte for byte. It keeps `Accept-Encoding`, `Content-Encoding` and `Content-Length` as the client and the target sent them, so a pack of any size never sits in memory. If the client sends no `Accept-Encoding`, the outpost sends `Accept-Encoding: identity`, so the target answers uncompressed.
 
 `PROXY_READ_TIMEOUT` limits how long the outpost waits for the next chunk of data, not the whole transfer. A long clone keeps running while data flows.
 

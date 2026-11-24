@@ -19,6 +19,7 @@ from fastapi import Request
 from fastapi import Response
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 from starlette.types import Receive
 from starlette.types import Scope
 from starlette.types import Send
@@ -237,10 +238,26 @@ def get_bearer_token() -> str | None:
     return token
 
 
+def connection_nominated(headers: Mapping[str, str]) -> set[str]:
+    """Headers the sender marked hop-by-hop by listing them in `Connection`."""
+    return {
+        token.strip().lower()
+        for k, v in headers.items()
+        if k.lower() == "connection"
+        for token in v.split(",")
+        if token.strip()
+    }
+
+
 def build_proxy_headers(
     request_headers: Mapping[str, str], passthrough_encoding: bool = False
 ) -> dict[str, str]:
-    dropped = {"host"} if passthrough_encoding else {"host", "accept-encoding"}
+    if passthrough_encoding:
+        # Only the git path honors Connection-nominated headers, so every other
+        # request keeps forwarding exactly what it did before.
+        dropped = {"host"} | connection_nominated(request_headers)
+    else:
+        dropped = {"host", "accept-encoding"}
     headers = {
         k: v
         for k, v in request_headers.items()
@@ -421,13 +438,12 @@ class UpstreamStreamingResponse(StreamingResponse):
     def __init__(self, upstream: httpx.Response) -> None:
         self.upstream = upstream
         self.chunks = self._relay()
+        dropped = HOP_BY_HOP_HEADERS | connection_nominated(upstream.headers)
         super().__init__(
             self.chunks,
             status_code=upstream.status_code,
             headers={
-                k: v
-                for k, v in upstream.headers.items()
-                if k.lower() not in HOP_BY_HOP_HEADERS
+                k: v for k, v in upstream.headers.items() if k.lower() not in dropped
             },
         )
 
@@ -482,6 +498,12 @@ async def stream_git(request: Request, url: str) -> Response:
         upstream = await client.send(upstream_request, stream=True)
     except (httpx.TransportError, httpx.InvalidURL) as exc:
         return upstream_failure_response(exc)
+    except ClientDisconnect:
+        # The client hung up mid-upload. httpx has already dropped the target
+        # connection, and nobody is left to read a response, so this is not an
+        # outpost failure worth a traceback.
+        logger.info("Client disconnected while uploading to %s", SAFE_TARGET)
+        return Response(status_code=400)
 
     return UpstreamStreamingResponse(upstream)
 
