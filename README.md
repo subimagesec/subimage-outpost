@@ -61,9 +61,9 @@ To check that an outpost supports Git, call `GET /_internal/version` and confirm
 
 ### Compressed responses
 
-From version 1.2.7, the outpost passes compressed responses through to clients that accept gzip. If the `Accept-Encoding` of a request lists `gzip`, the outpost handles it the way it handles Git traffic: it forwards the client's `Accept-Encoding`, then streams the target's body back with its `Content-Encoding` and `Content-Length`. A Kubernetes API server gzips large responses, so a big `list` call crosses the tailnet at about a tenth of its size.
+From version 1.2.7, the outpost passes compressed responses through to clients that accept gzip. If the `Accept-Encoding` of a request lists `gzip` with a quality above zero (`gzip;q=0` doesn't count), the outpost handles it the way it handles Git traffic: it forwards the client's `Accept-Encoding`, then streams the target's body back with its `Content-Encoding` and `Content-Length`. A Kubernetes API server gzips large responses, so a big `list` call crosses the tailnet at about a tenth of its size.
 
-If the `Accept-Encoding` of a request doesn't list `gzip`, or the request has none, the outpost buffers the request, asks the target for `gzip, deflate`, and returns the decoded body without `Content-Encoding`.
+If the `Accept-Encoding` of a request doesn't accept `gzip`, or the request has none, the outpost buffers the request, asks the target for `gzip, deflate`, and returns the decoded body without `Content-Encoding`.
 
 To check that an outpost passes compressed responses through, call `GET /_internal/version` and confirm that `version` is `1.2.7` or later.
 
