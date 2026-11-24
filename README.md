@@ -1,4 +1,4 @@
-# SubImage Outpost
+# Subimage Outpost
 
 Securely expose internal HTTP(S) APIs from a customer's private network to our tailnet
 
@@ -11,8 +11,8 @@ This container runs:
 
 | Variable              | Description                                                  |
 |-----------------------|--------------------------------------------------------------|
-| `TAILSCALE_AUTHKEY`   | OAuth client secret from SubImage                            |
-| `TENANT_ID`           | Your tenant ID (provided by SubImage)                        |
+| `TAILSCALE_AUTHKEY`   | OAuth client secret from Subimage                            |
+| `TENANT_ID`           | Your tenant ID (provided by Subimage)                        |
 | `PROXY_TARGET`        | Full target URL to proxy (e.g. `https://snipeit.internal`)   |
 
 ## Optional Environment Variables
@@ -132,14 +132,40 @@ This project uses [semantic versioning](https://semver.org):
 make release VERSION=0.0.1
 ```
 
-When a new tag is pushed, GitHub Actions automatically builds and pushes a multi-architecture Docker image (amd64 and arm64) to our ECR repository.
+When you push a tag, GitHub Actions builds a multi-architecture image (amd64 and arm64), pushes it to `ghcr.io/subimagesec/subimage-outpost`, and attests it. It then publishes the GitHub release with the image digest in the notes. If the build fails, no release is published.
+
+A published release locks its version: you can't move or reuse its git tag. To change a release, publish a new version.
 
 ## Architecture Support
 
 The container image supports both x86_64 (amd64) and ARM64 architectures. Docker will automatically pull the appropriate image variant based on your host architecture.
 
+## Verify the image
+
+A version tag such as `1.2.6` is a pointer that the registry lets a publisher move to a different image. A digest identifies one image and never changes. To run the exact image that Subimage released, verify the image, and then pull it by digest.
+
+Starting with version 1.2.6, GitHub Actions signs a record of each image that it builds from this repository. Earlier versions have no record to verify.
+
+1. Find the digest. Each release lists it at the top of its release notes.
+
+1. Verify that this repository's release workflow built the image:
+
+   ```bash
+   gh attestation verify oci://ghcr.io/subimagesec/subimage-outpost@DIGEST \
+     --repo subimagesec/subimage-outpost \
+     --signer-workflow subimagesec/subimage-outpost/.github/workflows/release.yml
+   ```
+
+1. Pull the image by digest:
+
+   ```bash
+   docker pull ghcr.io/subimagesec/subimage-outpost@DIGEST
+   ```
+
+Replace `DIGEST` with the digest from the release notes, including its `sha256:` prefix.
+
 ---
-## Why SubImage Outpost?
+## Why Subimage Outpost?
 1. Requires no inbound firewall changes.
 1. Encrypted via WireGuard automatically.
 1. Requires no changes to Cartography ingestion

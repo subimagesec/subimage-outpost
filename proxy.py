@@ -60,7 +60,7 @@ DECODED_BODY_HEADERS = frozenset(["content-encoding", "content-length"])
 
 # Because the decoded body goes out with no Content-Encoding, the target may use
 # only encodings httpx decodes here. brotli and zstandard are not installed, and
-# SubImage's httpx clients advertise zstd, so the client's own list is replaced.
+# Subimage's httpx clients advertise zstd, so the client's own list is replaced.
 UPSTREAM_ACCEPT_ENCODING = "gzip, deflate"
 
 # Git smart-HTTP services. Their requests and responses are streamed through
