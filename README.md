@@ -134,28 +134,34 @@ make release VERSION=0.0.1
 
 When you push a tag, GitHub Actions builds a multi-architecture image (amd64 and arm64), pushes it to `ghcr.io/subimagesec/subimage-outpost`, and attests it. It then publishes the GitHub release with the image digest in the notes. If the build fails, no release is published.
 
+A published release locks its version: you can't move or reuse its git tag. To change a release, publish a new version.
+
 ## Architecture Support
 
 The container image supports both x86_64 (amd64) and ARM64 architectures. Docker will automatically pull the appropriate image variant based on your host architecture.
 
 ## Verify the image
 
-Releases after 1.2.5 carry a signed build provenance attestation from GitHub Actions. Earlier releases have none.
+A version tag such as `1.2.6` is a pointer that the registry lets a publisher move to a different image. A digest identifies one image and never changes. To run the exact image that Subimage released, verify the image, and then pull it by digest.
 
-To check that an image was built by this repository's release workflow, run:
+Starting with version 1.2.6, GitHub Actions signs a record of each image that it builds from this repository. Earlier versions have no record to verify.
 
-```bash
-gh attestation verify oci://ghcr.io/subimagesec/subimage-outpost:1.2.6 \
-  --repo subimagesec/subimage-outpost
-```
+1. Find the digest. Each release lists it at the top of its release notes.
 
-To run exactly the image you verified, pull it by digest. Each release lists its digest in the release notes:
+1. Verify that this repository's release workflow built the image:
 
-```bash
-docker pull ghcr.io/subimagesec/subimage-outpost@sha256:<digest>
-```
+   ```bash
+   gh attestation verify oci://ghcr.io/subimagesec/subimage-outpost@sha256:DIGEST \
+     --repo subimagesec/subimage-outpost
+   ```
 
-For releases after 1.2.5, the git tag and the GitHub release are immutable. Registry tags such as `1.2.6` and `latest` are not, so pin the digest.
+1. Pull the image by digest:
+
+   ```bash
+   docker pull ghcr.io/subimagesec/subimage-outpost@sha256:DIGEST
+   ```
+
+Replace `DIGEST` with the digest from the release notes.
 
 ---
 ## Why SubImage Outpost?
