@@ -869,12 +869,16 @@ def test_response_keeps_its_encoding_for_clients_that_accept_gzip(
 
 
 @pytest.mark.parametrize(
-    "client_headers",
-    [{}, {"Accept-Encoding": "br, zstd"}],
-    ids=["no-accept-encoding", "no-gzip"],
+    ("method", "client_headers", "content"),
+    [
+        ("GET", {}, None),
+        ("GET", {"Accept-Encoding": "br, zstd"}, None),
+        ("POST", {"Accept-Encoding": "gzip"}, iter([b"{}"])),
+    ],
+    ids=["no-accept-encoding", "no-gzip", "not-a-get"],
 )
 def test_api_response_is_decoded_for_clients_that_do_not_accept_gzip(
-    monkeypatch, client_headers
+    monkeypatch, method, client_headers, content
 ):
     received: list[tuple[str, Message, bytes]] = []
 
@@ -882,14 +886,44 @@ def test_api_response_is_decoded_for_clients_that_do_not_accept_gzip(
         proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
         with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
             del client.headers["Accept-Encoding"]
-            response = client.get(
-                f"{outpost}/apis/apps/v1/replicasets?limit=500", headers=client_headers
+            response = client.request(
+                method,
+                f"{outpost}/apis/apps/v1/replicasets?limit=500",
+                headers=client_headers,
+                content=content,
             )
 
     # Only encodings the outpost decodes, whatever the client listed.
     assert received[0][1]["Accept-Encoding"] == "gzip, deflate"
     assert "content-encoding" not in response.headers
     assert response.headers["content-length"] == str(len(GZIPPED_BODY))
+    assert response.content == GZIPPED_BODY
+
+
+def test_passthrough_drops_a_content_length_sent_beside_chunked_framing(monkeypatch):
+    class ChunkedWithStaleLength(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Length", "9999")
+            self.end_headers()
+            write_chunk(self, GZIPPED_BODY)
+            write_chunk(self, b"")
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(ChunkedWithStaleLength) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            response = client.get(
+                f"{outpost}/apis/apps/v1/replicasets",
+                headers={"Accept-Encoding": "gzip"},
+            )
+
+    assert "content-length" not in response.headers
     assert response.content == GZIPPED_BODY
 
 
