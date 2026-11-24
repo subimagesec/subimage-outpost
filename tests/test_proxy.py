@@ -895,7 +895,7 @@ def test_git_request_reaches_the_target_as_the_client_sent_it(monkeypatch):
     assert post_body == request_body
     assert post_headers["Content-Encoding"] == "gzip"
     assert post_headers["Accept-Encoding"] == "deflate, gzip, br, zstd"
-    assert post_headers["Authorization"] == "Basic Y2FsbGVyOnRva2Vu"
+    assert post_headers.get_all("Authorization") == ["Basic Y2FsbGVyOnRva2Vu"]
     assert get_path == "/team/app.git/info/refs?service=git-receive-pack"
     assert get_headers["Authorization"] == "Bearer outpost-token"
     # A bodyless GET goes out without a body framing header.
