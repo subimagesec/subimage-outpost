@@ -132,11 +132,30 @@ This project uses [semantic versioning](https://semver.org):
 make release VERSION=0.0.1
 ```
 
-When a new tag is pushed, GitHub Actions automatically builds and pushes a multi-architecture Docker image (amd64 and arm64) to our ECR repository.
+When you push a tag, GitHub Actions builds a multi-architecture image (amd64 and arm64), pushes it to `ghcr.io/subimagesec/subimage-outpost`, and attests it. It then publishes the GitHub release with the image digest in the notes. If the build fails, no release is published.
 
 ## Architecture Support
 
 The container image supports both x86_64 (amd64) and ARM64 architectures. Docker will automatically pull the appropriate image variant based on your host architecture.
+
+## Verify the image
+
+Releases after 1.2.5 carry a signed build provenance attestation from GitHub Actions. Earlier releases have none.
+
+To check that an image was built by this repository's release workflow, run:
+
+```bash
+gh attestation verify oci://ghcr.io/subimagesec/subimage-outpost:1.2.6 \
+  --repo subimagesec/subimage-outpost
+```
+
+To run exactly the image you verified, pull it by digest. Each release lists its digest in the release notes:
+
+```bash
+docker pull ghcr.io/subimagesec/subimage-outpost@sha256:<digest>
+```
+
+For releases after 1.2.5, the git tag and the GitHub release are immutable. Registry tags such as `1.2.6` and `latest` are not, so pin the digest.
 
 ---
 ## Why SubImage Outpost?
