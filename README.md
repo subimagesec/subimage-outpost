@@ -1,4 +1,4 @@
-# SubImage Outpost
+# Subimage Outpost
 
 Securely expose internal HTTP(S) APIs from a customer's private network to our tailnet
 
@@ -11,8 +11,8 @@ This container runs:
 
 | Variable              | Description                                                  |
 |-----------------------|--------------------------------------------------------------|
-| `TAILSCALE_AUTHKEY`   | OAuth client secret from SubImage                            |
-| `TENANT_ID`           | Your tenant ID (provided by SubImage)                        |
+| `TAILSCALE_AUTHKEY`   | OAuth client secret from Subimage                            |
+| `TENANT_ID`           | Your tenant ID (provided by Subimage)                        |
 | `PROXY_TARGET`        | Full target URL to proxy (e.g. `https://snipeit.internal`)   |
 
 ## Optional Environment Variables
@@ -151,20 +151,21 @@ Starting with version 1.2.6, GitHub Actions signs a record of each image that it
 1. Verify that this repository's release workflow built the image:
 
    ```bash
-   gh attestation verify oci://ghcr.io/subimagesec/subimage-outpost@sha256:DIGEST \
-     --repo subimagesec/subimage-outpost
+   gh attestation verify oci://ghcr.io/subimagesec/subimage-outpost@DIGEST \
+     --repo subimagesec/subimage-outpost \
+     --signer-workflow subimagesec/subimage-outpost/.github/workflows/release.yml
    ```
 
 1. Pull the image by digest:
 
    ```bash
-   docker pull ghcr.io/subimagesec/subimage-outpost@sha256:DIGEST
+   docker pull ghcr.io/subimagesec/subimage-outpost@DIGEST
    ```
 
-Replace `DIGEST` with the digest from the release notes.
+Replace `DIGEST` with the digest from the release notes, including its `sha256:` prefix.
 
 ---
-## Why SubImage Outpost?
+## Why Subimage Outpost?
 1. Requires no inbound firewall changes.
 1. Encrypted via WireGuard automatically.
 1. Requires no changes to Cartography ingestion

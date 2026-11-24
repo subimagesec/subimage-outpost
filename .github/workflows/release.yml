@@ -121,4 +121,4 @@ jobs:
           ghcr.io/${{ github.repository }}@${{ needs.build-and-publish-to-ghcr.outputs.digest }}
           ```
 
-          Verify it with `gh attestation verify oci://ghcr.io/${{ github.repository }}@${{ needs.build-and-publish-to-ghcr.outputs.digest }} --repo ${{ github.repository }}`.
+          Verify it with `gh attestation verify oci://ghcr.io/${{ github.repository }}@${{ needs.build-and-publish-to-ghcr.outputs.digest }} --repo ${{ github.repository }} --signer-workflow ${{ github.repository }}/.github/workflows/release.yml`.
