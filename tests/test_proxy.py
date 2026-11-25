@@ -278,13 +278,13 @@ def test_logtee_tees_and_rotates(tmp_path):
     assert "line 29" in log_file.read_text()
 
 
-def raise_on_request(exc: Exception):
-    """Stub for AsyncClient.request that always fails with `exc`."""
+def raise_on_send(exc: Exception):
+    """Stub for AsyncClient.send, which every proxied request goes through."""
 
-    async def _request(*args, **kwargs):
+    async def _send(*args, **kwargs):
         raise exc
 
-    return _request
+    return _send
 
 
 def test_timeout_defaults(monkeypatch):
@@ -360,8 +360,8 @@ def test_upstream_failure_does_not_leak_target_credentials(monkeypatch, caplog):
     with TestClient(proxy.app) as client:
         monkeypatch.setattr(
             proxy.app.state.client,
-            "request",
-            raise_on_request(httpx.ConnectTimeout("timed out")),
+            "send",
+            raise_on_send(httpx.ConnectTimeout("timed out")),
         )
         with caplog.at_level(logging.WARNING, logger="proxy"):
             response = client.get("/api/v1/namespaces/kube-system")
@@ -375,16 +375,22 @@ def test_upstream_failure_does_not_leak_target_credentials(monkeypatch, caplog):
     assert "s3cret" not in serialized
 
 
-def test_connect_timeout_returns_504(monkeypatch):
+@pytest.mark.parametrize(
+    "accept_encoding", ["gzip, deflate", "identity"], ids=["passthrough", "decoded"]
+)
+def test_connect_timeout_returns_504(monkeypatch, accept_encoding):
     proxy = load_proxy(monkeypatch)
 
     with TestClient(proxy.app) as client:
         monkeypatch.setattr(
             proxy.app.state.client,
-            "request",
-            raise_on_request(httpx.ConnectTimeout("timed out")),
+            "send",
+            raise_on_send(httpx.ConnectTimeout("timed out")),
         )
-        response = client.get("/api/v1/namespaces/kube-system")
+        response = client.get(
+            "/api/v1/namespaces/kube-system",
+            headers={"Accept-Encoding": accept_encoding},
+        )
 
     assert response.status_code == 504
     assert response.headers["content-type"].startswith("application/json")
@@ -404,9 +410,7 @@ def test_connect_error_and_read_timeout_return_504(monkeypatch):
         proxy = load_proxy(monkeypatch)
 
         with TestClient(proxy.app) as client:
-            monkeypatch.setattr(
-                proxy.app.state.client, "request", raise_on_request(exc)
-            )
+            monkeypatch.setattr(proxy.app.state.client, "send", raise_on_send(exc))
             response = client.get("/api/v1/namespaces/kube-system")
 
         assert response.status_code == 504, exc
@@ -419,8 +423,8 @@ def test_other_transport_error_returns_502(monkeypatch):
     with TestClient(proxy.app) as client:
         monkeypatch.setattr(
             proxy.app.state.client,
-            "request",
-            raise_on_request(httpx.RemoteProtocolError("bad chunk")),
+            "send",
+            raise_on_send(httpx.RemoteProtocolError("bad chunk")),
         )
         response = client.get("/api/v1/namespaces/kube-system")
 
@@ -437,8 +441,8 @@ def test_transport_failure_logs_one_warning_without_traceback(monkeypatch, caplo
     with TestClient(proxy.app) as client:
         monkeypatch.setattr(
             proxy.app.state.client,
-            "request",
-            raise_on_request(httpx.ConnectTimeout("timed out")),
+            "send",
+            raise_on_send(httpx.ConnectTimeout("timed out")),
         )
         with caplog.at_level(logging.WARNING, logger="proxy"):
             client.get("/api/v1/namespaces/kube-system")
@@ -474,8 +478,8 @@ def test_outpost_identity_uses_tailnet_hostname(monkeypatch):
     with TestClient(proxy.app) as client:
         monkeypatch.setattr(
             proxy.app.state.client,
-            "request",
-            raise_on_request(httpx.ConnectTimeout("timed out")),
+            "send",
+            raise_on_send(httpx.ConnectTimeout("timed out")),
         )
         response = client.get("/api/v1/namespaces/kube-system")
 
@@ -496,12 +500,16 @@ def test_single_client_is_reused_across_requests(monkeypatch):
 
     calls = []
 
-    async def fake_request(*args, **kwargs):
-        calls.append(kwargs["url"])
-        return httpx.Response(200, json={"ok": True})
+    async def fake_send(request, **kwargs):
+        calls.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=httpx.ByteStream(b'{"ok": true}'),
+        )
 
     with TestClient(proxy.app) as client:
-        monkeypatch.setattr(proxy.app.state.client, "request", fake_request)
+        monkeypatch.setattr(proxy.app.state.client, "send", fake_send)
 
         assert client.get("/api/v1/namespaces/kube-system").status_code == 200
         assert client.get("/api/v1/nodes").json() == {"ok": True}
@@ -568,47 +576,23 @@ def test_internal_routes_not_proxied(monkeypatch):
     assert "version" in response.json()
 
 
-def test_compressed_upstream_response_reaches_client_decodable(monkeypatch):
+@pytest.mark.parametrize(
+    ("accept_encoding", "expected"),
+    [
+        ("gzip", True),
+        ("GZip", True),
+        ("deflate, gzip;q=0.5", True),
+        ("gzip;q=0", False),
+        ("gzip; q=0.000", False),
+        ("gzip;q=abc", False),
+        ("br, zstd", False),
+        ("identity", False),
+    ],
+)
+def test_accepts_gzip(monkeypatch, accept_encoding, expected):
     proxy = load_proxy(monkeypatch)
-    body = b'{"id": 2, "name": "platform"}'
 
-    async def gzipped_request(*args, **kwargs):
-        response = httpx.Response(
-            200,
-            headers={
-                "content-type": "application/json",
-                "content-encoding": "gzip",
-                "content-length": str(len(gzip.compress(body))),
-            },
-            stream=httpx.ByteStream(gzip.compress(body)),
-        )
-        await response.aread()
-        return response
-
-    with TestClient(proxy.app) as client:
-        monkeypatch.setattr(proxy.app.state.client, "request", gzipped_request)
-        response = client.get("/api/v4/groups/2")
-
-    assert response.status_code == 200
-    assert response.content == body
-    assert response.headers["content-length"] == str(len(body))
-
-
-def test_target_is_asked_only_for_encodings_the_proxy_decodes(monkeypatch):
-    proxy = load_proxy(monkeypatch)
-    sent_headers = []
-
-    async def recording_request(*args, **kwargs):
-        sent_headers.append(kwargs["headers"])
-        return httpx.Response(200, json={"ok": True})
-
-    with TestClient(proxy.app) as client:
-        monkeypatch.setattr(proxy.app.state.client, "request", recording_request)
-        client.get(
-            "/api/v4/groups/2", headers={"Accept-Encoding": "gzip, deflate, br, zstd"}
-        )
-
-    assert sent_headers[0]["Accept-Encoding"] == "gzip, deflate"
+    assert proxy.accepts_gzip({"Accept-Encoding": accept_encoding}) is expected
 
 
 # Git smart-HTTP streaming. These run the proxy under a real uvicorn server
@@ -857,26 +841,90 @@ def gzip_upstream(
     return GzipEverything
 
 
-def test_git_response_keeps_its_encoding_while_api_responses_are_decoded(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("path", "accept_encoding"),
+    [
+        ("/team/app.git/info/refs?service=git-upload-pack", "gzip"),
+        ("/apis/apps/v1/replicasets?limit=500", "gzip, deflate, br, zstd"),
+    ],
+    ids=["git", "api"],
+)
+def test_response_keeps_its_encoding_for_clients_that_accept_gzip(
+    monkeypatch, path, accept_encoding
 ):
-    with serve_upstream(gzip_upstream([])) as upstream:
+    received: list[tuple[str, Message, bytes]] = []
+
+    with serve_upstream(gzip_upstream(received)) as upstream:
         proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
         with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
             with client.stream(
-                "GET",
-                f"{outpost}/team/app.git/info/refs?service=git-upload-pack",
-                headers={"Accept-Encoding": "gzip"},
-            ) as git_response:
-                git_raw = b"".join(git_response.iter_raw())
-            api_response = client.get(
-                f"{outpost}/api/v3/meta", headers={"Accept-Encoding": "gzip, br"}
+                "GET", f"{outpost}{path}", headers={"Accept-Encoding": accept_encoding}
+            ) as response:
+                raw = b"".join(response.iter_raw())
+
+    assert received[0][1]["Accept-Encoding"] == accept_encoding
+    assert response.headers["content-encoding"] == "gzip"
+    assert response.headers["content-length"] == str(len(raw))
+    assert gzip.decompress(raw) == GZIPPED_BODY
+
+
+@pytest.mark.parametrize(
+    ("method", "client_headers", "content"),
+    [
+        ("GET", {}, None),
+        ("GET", {"Accept-Encoding": "br, zstd"}, None),
+        ("POST", {"Accept-Encoding": "gzip"}, iter([b"{}"])),
+    ],
+    ids=["no-accept-encoding", "no-gzip", "not-a-get"],
+)
+def test_api_response_is_decoded_for_clients_that_do_not_accept_gzip(
+    monkeypatch, method, client_headers, content
+):
+    received: list[tuple[str, Message, bytes]] = []
+
+    with serve_upstream(gzip_upstream(received)) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            del client.headers["Accept-Encoding"]
+            response = client.request(
+                method,
+                f"{outpost}/apis/apps/v1/replicasets?limit=500",
+                headers=client_headers,
+                content=content,
             )
 
-    assert git_response.headers["content-encoding"] == "gzip"
-    assert gzip.decompress(git_raw) == GZIPPED_BODY
-    assert "content-encoding" not in api_response.headers
-    assert api_response.content == GZIPPED_BODY
+    # Only encodings the outpost decodes, whatever the client listed.
+    assert received[0][1]["Accept-Encoding"] == "gzip, deflate"
+    assert "content-encoding" not in response.headers
+    assert response.headers["content-length"] == str(len(GZIPPED_BODY))
+    assert response.content == GZIPPED_BODY
+
+
+def test_passthrough_drops_a_content_length_sent_beside_chunked_framing(monkeypatch):
+    class ChunkedWithStaleLength(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Length", "9999")
+            self.end_headers()
+            write_chunk(self, GZIPPED_BODY)
+            write_chunk(self, b"")
+
+        def log_message(self, *args):
+            pass
+
+    with serve_upstream(ChunkedWithStaleLength) as upstream:
+        proxy = load_proxy(monkeypatch, env={"PROXY_TARGET": upstream})
+        with serve_proxy(proxy) as outpost, httpx.Client(trust_env=False) as client:
+            response = client.get(
+                f"{outpost}/apis/apps/v1/replicasets",
+                headers={"Accept-Encoding": "gzip"},
+            )
+
+    assert "content-length" not in response.headers
+    assert response.content == GZIPPED_BODY
 
 
 def test_git_request_reaches_the_target_as_the_client_sent_it(monkeypatch):

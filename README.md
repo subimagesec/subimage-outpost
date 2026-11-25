@@ -51,15 +51,21 @@ If either variable is set, the proxy automatically adds an `Authorization: Beare
 
 From version 1.2.5, you can run `git clone`, `git fetch` and `git push` through the outpost against a Git smart-HTTP server, such as GitHub Enterprise Server.
 
-The outpost recognizes Git traffic by its URL: `GET .../info/refs?service=git-upload-pack` or `?service=git-receive-pack`, and `POST .../git-upload-pack` or `.../git-receive-pack`. For these requests, the outpost streams the request and the response in both directions and passes them through byte for byte. It keeps `Accept-Encoding`, `Content-Encoding` and `Content-Length` as the client and the target sent them, so a pack of any size never sits in memory. If the client sends no `Accept-Encoding`, the outpost sends `Accept-Encoding: identity`, so the target answers uncompressed.
+The outpost recognizes Git traffic by its URL: `GET .../info/refs?service=git-upload-pack` or `?service=git-receive-pack`, and `POST .../git-upload-pack` or `.../git-receive-pack`. For these requests, the outpost streams the request and the response in both directions and passes them through byte for byte. It keeps `Accept-Encoding`, `Content-Encoding` and `Content-Length` as the client and the target sent them, so a pack of any size never sits in memory. The one exception is a `Content-Length` that the target sends alongside `Transfer-Encoding`, which the outpost drops, as HTTP requires of a proxy. If the client sends no `Accept-Encoding`, the outpost sends `Accept-Encoding: identity`, so the target answers uncompressed.
 
 `PROXY_READ_TIMEOUT` limits how long the outpost waits for the next chunk of data, not the whole transfer. A long clone keeps running while data flows.
 
 If the target fails before it answers, you get the usual JSON error with status 502 or 504. If the target fails after the response starts, the outpost closes the connection before the body ends, and Git reports the transfer as failed.
 
-All other requests work as before: the outpost buffers them and decodes compressed responses.
-
 To check that an outpost supports Git, call `GET /_internal/version` and confirm that `version` is `1.2.5` or later.
+
+### Compressed responses
+
+From version 1.2.7, the outpost passes compressed responses through to clients that accept gzip. If the `Accept-Encoding` of a `GET` request lists `gzip` with a quality above zero (`gzip;q=0` doesn't count), the outpost handles it the way it handles Git traffic: it forwards the client's `Accept-Encoding`, then streams the target's body back with its `Content-Encoding`, and with its `Content-Length` unless the target used chunked `Transfer-Encoding` instead. A Kubernetes API server gzips large responses, so a big `list` call crosses the tailnet at about a tenth of its size.
+
+For other non-Git requests, meaning other methods and `GET` requests whose `Accept-Encoding` doesn't accept `gzip` or is missing, the outpost buffers the request, asks the target for `gzip, deflate`, and returns the decoded body without `Content-Encoding`.
+
+To check that an outpost passes compressed responses through, call `GET /_internal/version` and confirm that `version` is `1.2.7` or later.
 
 ---
 

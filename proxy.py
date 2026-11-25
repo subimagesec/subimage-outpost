@@ -59,8 +59,8 @@ HOP_BY_HOP_HEADERS = frozenset(
 DECODED_BODY_HEADERS = frozenset(["content-encoding", "content-length"])
 
 # Because the decoded body goes out with no Content-Encoding, the target may use
-# only encodings httpx decodes here. brotli and zstandard are not installed, and
-# Subimage's httpx clients advertise zstd, so the client's own list is replaced.
+# only encodings httpx decodes here. brotli and zstandard are not installed, so
+# a client that does not take gzip has its own list replaced.
 UPSTREAM_ACCEPT_ENCODING = "gzip, deflate"
 
 # Git smart-HTTP services. Their requests and responses are streamed through
@@ -253,8 +253,8 @@ def build_proxy_headers(
     request_headers: Mapping[str, str], passthrough_encoding: bool = False
 ) -> dict[str, str]:
     if passthrough_encoding:
-        # Only the git path honors Connection-nominated headers, so every other
-        # request keeps forwarding exactly what it did before.
+        # Only passthrough requests honor Connection-nominated headers, so
+        # decoded requests keep forwarding exactly what they did before.
         dropped = {"host"} | connection_nominated(request_headers)
     else:
         dropped = {"host", "accept-encoding"}
@@ -294,6 +294,32 @@ def is_git_smart_http(method: str, path: str, service: str | None) -> bool:
         return segments[-2:] == ["info", "refs"] and service in GIT_SERVICES
     if method == "POST":
         return segments[-1] in GIT_SERVICES
+    return False
+
+
+def accepts_gzip(headers: Mapping[str, str]) -> bool:
+    """Whether the client's Accept-Encoding takes gzip, honoring `q=0`.
+
+    A GET from such a client gets the target's compressed body as is. A
+    Kubernetes list is mostly repeated JSON keys and shrinks about 12x, and the
+    tailnet, often over a relay, is the slowest hop of a sync. A client that
+    never asked for gzip, such as an older Subimage Kubernetes client, still
+    gets a decoded body. Other methods stay on the decoded path too, because it
+    buffers the request body and so always sends the target a Content-Length.
+    """
+    for k, v in headers.items():
+        if k.lower() != "accept-encoding":
+            continue
+        for item in v.split(","):
+            coding, *params = (part.strip().lower() for part in item.split(";"))
+            if coding != "gzip":
+                continue
+            weight = next((p[2:] for p in params if p.startswith("q=")), "1")
+            try:
+                if float(weight) > 0:
+                    return True
+            except ValueError:
+                continue
     return False
 
 
@@ -439,6 +465,10 @@ class UpstreamStreamingResponse(StreamingResponse):
         self.upstream = upstream
         self.chunks = self._relay()
         dropped = HOP_BY_HOP_HEADERS | connection_nominated(upstream.headers)
+        if "transfer-encoding" in upstream.headers:
+            # RFC 9112 6.3: Transfer-Encoding overrides a Content-Length sent beside
+            # it, and a proxy must drop that length rather than relay it.
+            dropped |= {"content-length"}
         super().__init__(
             self.chunks,
             status_code=upstream.status_code,
@@ -479,7 +509,7 @@ class UpstreamStreamingResponse(StreamingResponse):
             await self.upstream.aclose()
 
 
-async def stream_git(request: Request, url: str) -> Response:
+async def stream_passthrough(request: Request, url: str) -> Response:
     client: httpx.AsyncClient = request.app.state.client
     has_body = (
         "content-length" in request.headers or "transfer-encoding" in request.headers
@@ -515,8 +545,10 @@ async def proxy(request: Request, path: str):
 
     url = f"{TARGET.rstrip('/')}/{path}"
 
-    if is_git_smart_http(request.method, path, request.query_params.get("service")):
-        return await stream_git(request, url)
+    if is_git_smart_http(request.method, path, request.query_params.get("service")) or (
+        request.method == "GET" and accepts_gzip(request.headers)
+    ):
+        return await stream_passthrough(request, url)
 
     headers = build_proxy_headers(request.headers)
     client: httpx.AsyncClient = request.app.state.client
