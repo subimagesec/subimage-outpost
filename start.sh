@@ -52,7 +52,7 @@ if [ -n "${TAILSCALE_CLIENT_ID}" ]; then
     echo "Authenticating with workload identity (ID token fetched from the cloud provider)"
     set -- --client-id="${TAILSCALE_CLIENT_ID}" --audience="${TAILSCALE_AUDIENCE}"
   elif [ -n "${TAILSCALE_ID_TOKEN_PATH}" ]; then
-    if [ ! -r "${TAILSCALE_ID_TOKEN_PATH}" ]; then
+    if [ ! -f "${TAILSCALE_ID_TOKEN_PATH}" ] || [ ! -r "${TAILSCALE_ID_TOKEN_PATH}" ]; then
       echo "ERROR: TAILSCALE_ID_TOKEN_PATH ${TAILSCALE_ID_TOKEN_PATH} is not a readable file"
       exit 1
     fi
@@ -62,6 +62,11 @@ if [ -n "${TAILSCALE_CLIENT_ID}" ]; then
     echo "ERROR: TAILSCALE_CLIENT_ID needs TAILSCALE_AUDIENCE or TAILSCALE_ID_TOKEN_PATH"
     exit 1
   fi
+elif [ -n "${TAILSCALE_AUDIENCE}" ] || [ -n "${TAILSCALE_ID_TOKEN_PATH}" ]; then
+  # Without this, a deployment that meant to use workload identity but lost its
+  # client ID would quietly fall back to the long-lived registration key.
+  echo "ERROR: TAILSCALE_AUDIENCE and TAILSCALE_ID_TOKEN_PATH need TAILSCALE_CLIENT_ID"
+  exit 1
 elif [ -n "${TAILSCALE_AUTHKEY}" ]; then
   echo "Authenticating with a registration key"
   set -- --auth-key="${TAILSCALE_AUTHKEY}"
