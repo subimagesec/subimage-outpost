@@ -11,9 +11,64 @@ This container runs:
 
 | Variable              | Description                                                  |
 |-----------------------|--------------------------------------------------------------|
-| `TAILSCALE_AUTHKEY`   | OAuth client secret from Subimage                            |
 | `TENANT_ID`           | Your tenant ID (provided by Subimage)                        |
 | `PROXY_TARGET`        | Full target URL to proxy (e.g. `https://snipeit.internal`)   |
+
+The outpost also needs one tailnet credential, described in [Tailnet credentials](#tailnet-credentials).
+
+## Tailnet credentials
+
+The outpost joins Subimage's tailnet in one of two ways.
+
+### Workload identity (recommended)
+
+From version 1.2.8, the outpost can join with a short-lived ID token from the platform it runs on, so it holds no long-lived secret. Subimage creates a Tailscale federated identity that trusts your issuer and subject, and gives you its client ID and audience. Neither value is secret.
+
+| Variable                  | Description                                                  |
+|---------------------------|--------------------------------------------------------------|
+| `TAILSCALE_CLIENT_ID`     | Client ID of the federated identity                          |
+| `TAILSCALE_AUDIENCE`      | Audience of the federated identity. On AWS and Google Cloud, Tailscale fetches the ID token from the platform for you. |
+| `TAILSCALE_ID_TOKEN_PATH` | Path to a file that holds the ID token, such as a projected Kubernetes service account token. Use it where Tailscale can't fetch the token itself. |
+
+Set `TAILSCALE_CLIENT_ID` with exactly one of `TAILSCALE_AUDIENCE` or `TAILSCALE_ID_TOKEN_PATH`. The outpost registers as an ephemeral node, and it reads a fresh token each time it starts.
+
+On AWS (EC2, ECS or EKS), the outpost uses its IAM role:
+
+1. Turn on outbound identity federation for the account with `aws iam enable-outbound-web-identity-federation`. Its issuer URL is `https://<id>.tokens.sts.global.api.aws`.
+1. Allow the role to call `sts:GetWebIdentityToken` for the Tailscale audience:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "AllowGetWebIdentityTokenForTailscale",
+         "Effect": "Allow",
+         "Action": "sts:GetWebIdentityToken",
+         "Resource": "*",
+         "Condition": {
+           "ForAnyValue:StringEquals": { "sts:IdentityTokenAudience": "<audience>" },
+           "NumericLessThanEquals": { "sts:DurationSeconds": "300" }
+         }
+       }
+     ]
+   }
+   ```
+
+1. Send Subimage the issuer URL and the role ARN, which is the token's subject.
+
+Tailscale detects AWS through the IMDSv2 token endpoint, or through the ECS task metadata variables on ECS:
+
+- On EC2 with Docker's default bridge network, the container reaches the instance metadata service through one extra network hop. Set the instance's metadata hop limit to 2, or run the container with `--network host`. Otherwise Tailscale can't detect AWS and fails with `federated identity authkeys require --id-token`.
+- On ECS, Tailscale reads the region from `AWS_REGION` or `AWS_DEFAULT_REGION`, because ECS has no instance metadata to read it from. Set one of them if the task doesn't already have it.
+
+### Registration key
+
+| Variable              | Description                                                  |
+|-----------------------|--------------------------------------------------------------|
+| `TAILSCALE_AUTHKEY`   | Outpost registration key from Subimage, ending in `?ephemeral=true` |
+
+Use it where the platform has no publicly reachable OIDC issuer.
 
 ## Optional Environment Variables
 
@@ -88,6 +143,19 @@ docker run -d --restart unless-stopped \
 Hostname: `acme-subimage-outpost`
 Tags: `tag:acme-prod-outpost`
 
+### Workload identity on EC2
+
+```bash
+docker run -d --restart unless-stopped --network host \
+  -e TAILSCALE_CLIENT_ID=<client-id> \
+  -e TAILSCALE_AUDIENCE=<audience> \
+  -e TENANT_ID=acme \
+  -e NAME=it \
+  -e PROXY_TARGET=https://snipeit.corp.acme.com \
+  -e VERIFY_TLS=true \
+  proxy
+```
+
 ### Multiple outposts
 
 Deploy separate outposts for different networks/services:
@@ -122,7 +190,7 @@ docker run -d --restart unless-stopped \
 Hostname: `acme-it-outpost`
 Tags: `tag:acme-prod-outpost`
 
-All outposts for a tenant+environment share the same OAuth secret and Tailscale tag - just use different `NAME` values to get unique hostnames.
+All outposts for a tenant+environment share the same Tailscale tag - just use different `NAME` values to get unique hostnames.
 
 ### Restarts
 

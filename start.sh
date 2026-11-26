@@ -10,7 +10,11 @@ cleanup() {
     [ "$_cleaned" = "1" ] && return 0
     _cleaned=1
     echo "Shutting down outpost..."
-    tailscale logout || true
+    # A startup that fails before tailscaled runs has no node to log out. The
+    # sleep still runs so logtee flushes the error before the container exits.
+    if [ -S /var/run/tailscale/tailscaled.sock ]; then
+        tailscale logout || true
+    fi
     sleep 3
 }
 trap cleanup INT TERM EXIT
@@ -29,6 +33,47 @@ rm -f "$_log_pipe"
 # Config
 PROXY_PORT="8080"
 TAILSCALE_SERVE_PORT="80"
+
+# Workload identity federation joins the tailnet with a short-lived token from
+# the platform the outpost runs on, so no long-lived secret has to be handed
+# over. The registration key stays supported for platforms without a public
+# OIDC issuer. The auth arguments go in "$@" rather than a string so a key such
+# as `tskey-client-...?ephemeral=true` is never word-split or globbed.
+if [ -n "${TAILSCALE_CLIENT_ID}" ]; then
+  if [ -n "${TAILSCALE_AUTHKEY}" ]; then
+    echo "ERROR: Set TAILSCALE_CLIENT_ID for workload identity or TAILSCALE_AUTHKEY for a registration key, not both"
+    exit 1
+  fi
+  if [ -n "${TAILSCALE_AUDIENCE}" ] && [ -n "${TAILSCALE_ID_TOKEN_PATH}" ]; then
+    echo "ERROR: Set TAILSCALE_AUDIENCE or TAILSCALE_ID_TOKEN_PATH, not both"
+    exit 1
+  fi
+  if [ -n "${TAILSCALE_AUDIENCE}" ]; then
+    echo "Authenticating with workload identity (ID token fetched from the cloud provider)"
+    set -- --client-id="${TAILSCALE_CLIENT_ID}" --audience="${TAILSCALE_AUDIENCE}"
+  elif [ -n "${TAILSCALE_ID_TOKEN_PATH}" ]; then
+    if [ ! -f "${TAILSCALE_ID_TOKEN_PATH}" ] || [ ! -r "${TAILSCALE_ID_TOKEN_PATH}" ]; then
+      echo "ERROR: TAILSCALE_ID_TOKEN_PATH ${TAILSCALE_ID_TOKEN_PATH} is not a readable file"
+      exit 1
+    fi
+    echo "Authenticating with workload identity (ID token read from ${TAILSCALE_ID_TOKEN_PATH})"
+    set -- --client-id="${TAILSCALE_CLIENT_ID}" --id-token="file:${TAILSCALE_ID_TOKEN_PATH}"
+  else
+    echo "ERROR: TAILSCALE_CLIENT_ID needs TAILSCALE_AUDIENCE or TAILSCALE_ID_TOKEN_PATH"
+    exit 1
+  fi
+elif [ -n "${TAILSCALE_AUDIENCE}" ] || [ -n "${TAILSCALE_ID_TOKEN_PATH}" ]; then
+  # Without this, a deployment that meant to use workload identity but lost its
+  # client ID would quietly fall back to the long-lived registration key.
+  echo "ERROR: TAILSCALE_AUDIENCE and TAILSCALE_ID_TOKEN_PATH need TAILSCALE_CLIENT_ID"
+  exit 1
+elif [ -n "${TAILSCALE_AUTHKEY}" ]; then
+  echo "Authenticating with a registration key"
+  set -- --auth-key="${TAILSCALE_AUTHKEY}"
+else
+  echo "ERROR: Set TAILSCALE_CLIENT_ID (workload identity) or TAILSCALE_AUTHKEY (registration key)"
+  exit 1
+fi
 
 # If ENVIRONMENT is not set, default to "prod"
 if [ -z "${ENVIRONMENT}" ]; then
@@ -68,7 +113,7 @@ echo "Tailscaled socket ready"
 
 # Connect to the tailnet
 echo "Connecting to Tailscale network..."
-tailscale up --authkey="${TAILSCALE_AUTHKEY}" --hostname="${TAILSCALE_HOSTNAME:-proxy}" --accept-routes ${TS_EXTRA_ARGS}
+tailscale up "$@" --hostname="${TAILSCALE_HOSTNAME:-proxy}" --accept-routes ${TS_EXTRA_ARGS}
 echo "Connected to Tailscale"
 
 # Start proxy
